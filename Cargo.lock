@@ -56,22 +56,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "cookie"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7efb37c3e1ccb1ff97164ad95ac1606e8ccd35b3fa0a7d99a304c7f4a428cc24"
-dependencies = [
- "time",
- "version_check",
-]
-
-[[package]]
 name = "cookie_store"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bca9b3c618262fc0c85ecbc814c144e04be9c6eec08b315e7cd1cfbe0bb6ca84"
 dependencies = [
- "cookie 0.16.2",
+ "cookie",
  "idna",
  "indexmap",
  "log",
@@ -224,7 +214,6 @@ name = "rizzle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cookie 0.17.0",
  "serde",
  "serde_json",
  "ureq",
@@ -382,7 +371,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "338b31dd1314f68f3aabf3ed57ab922df95ffcd902476ca7ba3c4ce7b908c46d"
 dependencies = [
  "base64",
- "cookie 0.16.2",
+ "cookie",
  "cookie_store",
  "flate2",
  "log",
