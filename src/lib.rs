@@ -10,11 +10,15 @@ mod test;
 mod error;
 mod util;
 
+use blowfish::Blowfish;
+use cipher::{KeyInit, BlockCipher, BlockEncrypt, BlockDecrypt, BlockSizeUser};
+use generic_array::GenericArray;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tinyvec::{ArrayVec, SliceVec};
 use util::OptionToResult;
 
-use std::sync::{Arc, Mutex};
+use std::{sync::{Arc, Mutex}, iter::{repeat, zip}, io::{Read, self}};
 
 use error::Error;
 
@@ -74,28 +78,21 @@ impl Session {
             .middleware(middleware)
             .build();
 
+        let mut session = Self {
+            agent,
+            info,
+            api_token: "".to_string(),
+        };
+
         // get the session id and api token from deezer
         // so we can use the full gw-light api
 
-        let result: Value = agent.post("https://www.deezer.com/ajax/gw-light.php")
-            .query("method", "deezer.getUserData")
-            .query("input", "3")
-            .query("api_version", "1.0")
-            .query("api_token", "")
-            .query("cid", "132524931") // Math.floor(1000000000 * Math.random())
-            .set("Content-Length", "2")
-            .send_string("{}")?
-            .into_json()?;
-
+        let result = session.gw_light_query("deezer.getUserData", json!({}))?;
         let api_token = result["results"]["checkForm"].as_str().some()?.to_string();
 
-        println!("api token: {}", api_token);
+        session.api_token = api_token;
 
-        Ok(Self {
-            agent,
-            info,
-            api_token,
-        })
+        Ok(session)
             
     }
 
@@ -154,9 +151,26 @@ impl Session {
         let result = &response["results"]["data"][0];
         let track_details = TrackDetails::deserialize(result)?;
 
+        let song_quality = 1;
 
+        let url_key = generate_url_key(&track_details, song_quality);
 
-        Ok(TrackStream {})
+        let url = format!("https://e-cdns-proxy-{}.dzcdn.net/mobile/1/{}", &track_details.md5_origin[0..1], url_key);
+
+        eprintln!("Url: {}", url);
+
+        let reader = self.agent.get(&url).call().map_err(|err| Error::CannotDownload(err))?.into_reader();
+
+        let blowfish_key = generate_blowfish_key(&track_details);
+        let blowfish = Blowfish::new_from_slice(blowfish_key.as_bytes()).expect("Invalid key for Blowfish");
+
+        Ok(TrackStream {
+            reader,
+            blowfish,
+            iv: *b"\x00\x01\x02\x03\x04\x05\x06\x07", // magic iv value
+            count: 0,
+            storage: ArrayVec::default(),
+        })
 
     }
 
@@ -193,7 +207,121 @@ impl Session {
 
 }
 
+fn generate_blowfish_key(track_details: &TrackDetails) -> String {
+
+    let key = b"g4el58wc0zvf9na1";
+
+    let id_md5 = md5::compute(track_details.id.to_string().as_bytes());
+    let id_md5_str = hex::encode(id_md5.0);
+    let id_md5_bytes = id_md5_str.as_bytes();
+
+    let mut result = String::with_capacity(16);
+
+    for idx in 0..16 {
+        let value = id_md5_bytes[idx] ^ id_md5_bytes[idx + 16] ^ key[idx];
+        result.push(value as char);
+    }
+
+    result
+
+}
+
+fn generate_url_key(track_details: &TrackDetails, quality: usize) -> String {
+
+    let mut data = Vec::new(); // todo: use smallvec / tinyvec
+
+    data.extend_from_slice(track_details.md5_origin.as_bytes());
+    data.extend_from_slice(b"\xa4");
+    data.extend_from_slice(quality.to_string().as_bytes());
+    data.extend_from_slice(b"\xa4");
+    data.extend_from_slice(track_details.id.to_string().as_bytes());
+    data.extend_from_slice(b"\xa4");
+    data.extend_from_slice(track_details.media_version.to_string().as_bytes());
+
+    let data_md5 = md5::compute(&data);
+    let data_md5_str = hex::encode(data_md5.0);
+
+    let mut data_full = Vec::new(); // todo: use smallvec / tinyvec
+
+    data_full.extend_from_slice(data_md5_str.as_bytes());
+    data_full.extend_from_slice(b"\xa4");
+    data_full.extend_from_slice(&data);
+    data_full.extend_from_slice(b"\xa4");
+
+    let missing = data_full.len() % 16;
+    if missing != 0 {
+        data_full.extend(repeat(b'\0').take(16 - missing))
+    }
+    
+    assert!(data_full.len() % 16 == 0);
+
+    let key = b"jo6aey6haid2Teih";
+    let cipher = aes::Aes128Enc::new(key.into());
+
+    for block in data_full.chunks_mut(16).map(|chunk| chunk.into()) {
+        cipher.encrypt_block(block);
+    }
+
+    let encoded = hex::encode(data_full);
+
+    return encoded
+
+}
+
 pub struct TrackStream {
+    reader: Box<dyn Read>,
+    blowfish: Blowfish,
+    iv: [u8; 8],
+    count: usize,
+    storage: ArrayVec<[u8; 2048]>,
+}
+
+impl Read for TrackStream {
+
+    fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
+
+        let mut dest = SliceVec::from(buff);
+        dest.clear();
+
+        let len = dest.capacity();
+
+        // if we have more bytes stored then requested: write 'em all
+        if len <= self.storage.len() {
+            dest.extend(self.storage.drain(..len));
+            return Ok(len);
+        }
+
+        let new_len = len - self.storage.len();
+        let to_read = new_len + (2048 - new_len % 2048);
+
+        dest.extend(self.storage.drain(..));
+
+        let mut raw_bytes = vec![0; to_read];
+        match self.reader.read_exact(&mut raw_bytes) {
+            Ok(..) => (),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
+            Err(err) => return Err(err)
+        };
+
+        for chunk in raw_bytes.chunks_exact_mut(2048) {
+            if self.count % 3 == 0 {
+                for block in chunk.chunks_exact_mut(8) {
+                    self.blowfish.decrypt_block(GenericArray::from_mut_slice(block));
+                    for (byte, iv) in zip(block, self.iv) {
+                        *byte ^= iv;
+                    }
+                }
+            }
+            self.count += 1;
+        }
+
+        dest.extend(raw_bytes.drain(..new_len));
+
+        self.storage.extend(raw_bytes);
+
+        Ok(len)
+
+    }
 
 }
 
@@ -215,7 +343,12 @@ pub struct Track {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub(crate) struct TrackDetails {
-
+    #[serde(rename = "SNG_ID", deserialize_with = "str_to_u64")]
+    pub id: u64,
+    #[serde(rename = "MD5_ORIGIN")]
+    pub md5_origin: String,
+    #[serde(rename = "MEDIA_VERSION", deserialize_with = "str_to_u64")]
+    pub media_version: u64,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

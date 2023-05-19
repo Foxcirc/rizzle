@@ -8,6 +8,7 @@ pub enum Error {
     IoError(io::Error),
     NetworkError(ureq::Error),
     InvalidResponse,
+    CannotDownload(ureq::Error),
 }
 
 impl fmt::Display for Error {
@@ -15,6 +16,7 @@ impl fmt::Display for Error {
         match self {
             Self::IoError(value) => Display::fmt(value, f),
             Self::NetworkError(value) => Display::fmt(value, f),
+            Self::CannotDownload(value) => Display::fmt(value, f),
             Self::InvalidResponse => f.write_str("Invalid response"),
         }
     }

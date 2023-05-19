@@ -1,0 +1,12 @@
+[package]
+name = "rizzler"
+version = "0.1.0"
+edition = "2021"
+description = "Fast no-javascript Deezer Client made with Egui"
+
+[dependencies]
+alsa = "0.7.0"
+anyhow = "1.0.71"
+minimp3 = "0.5.1"
+rizzle = { path = ".." }
+

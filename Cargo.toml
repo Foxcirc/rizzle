@@ -1,10 +1,27 @@
+
 [package]
 name = "rizzle"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Deezer private API interface. Allows downloading songs and more."
+
+[workspace.package]
+authors = ["whyfoxcirc@gmx.de"]
+keywords = ["deezer", "api", "music"]
+repository = "github.com/foxcirc/rizzle"
+
+[workspace]
+members = ["dizzle"]
 
 [dependencies]
-anyhow = "1.0.71"
 serde = "1.0.163"
 serde_json = "1.0.96"
+tinyvec = { version = "1.6.0", features = ["std"] }
 ureq = { version = "*", features = ["json", "cookies"]}
+aes = "0.8.2"
+blowfish = "0.9.1"
+cipher = { version = "0.4.4", features = ["std"] }
+hex = "0.4.3"
+md5 = "0.7.0"
+generic-array = "0.14.7"
+
