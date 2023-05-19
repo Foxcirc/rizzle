@@ -9,4 +9,5 @@ alsa = "0.7.0"
 anyhow = "1.0.71"
 minimp3 = "0.5.1"
 rizzle = { path = ".." }
+wav = "1.0.0"
 

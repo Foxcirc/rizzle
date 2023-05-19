@@ -11,7 +11,7 @@ mod error;
 mod util;
 
 use blowfish::Blowfish;
-use cipher::{KeyInit, BlockCipher, BlockEncrypt, BlockDecrypt, BlockSizeUser};
+use cipher::{KeyInit, BlockEncrypt, BlockDecrypt};
 use generic_array::GenericArray;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -25,7 +25,7 @@ use error::Error;
 #[derive(Clone)]
 pub(crate) struct AuthMiddleware {
     pub(crate) user_agent: String,
-    pub(crate) info: Arc<Mutex<DeezerAuth<String>>>,
+    pub(crate) info: Arc<Mutex<Credentials<String>>>,
 }
 
 impl ureq::Middleware for AuthMiddleware {
@@ -49,22 +49,22 @@ impl ureq::Middleware for AuthMiddleware {
 }
 
 #[derive(Debug)]
-pub struct DeezerAuth<T> {
+pub struct Credentials<T> {
     pub sid: T,
     pub arl: T,
 }
 
 pub struct Session {
     agent: ureq::Agent,
-    info: Arc<Mutex<DeezerAuth<String>>>,
+    info: Arc<Mutex<Credentials<String>>>,
     api_token: String,
 }
 
 impl Session {
 
-    pub fn new<T: AsRef<str>>(info: DeezerAuth<T>) -> Result<Self, Error> {
+    pub fn new<T: AsRef<str>>(info: Credentials<T>) -> Result<Self, Error> {
 
-        let info = Arc::new(Mutex::new(DeezerAuth {
+        let info = Arc::new(Mutex::new(Credentials {
             sid: info.sid.as_ref().to_string(),
             arl: info.arl.as_ref().to_string(),
         }));
@@ -140,41 +140,35 @@ impl Session {
 
     }
 
+    pub fn details(artist: &Artist) -> Result<(), Error> {
+
+        Ok(())
+        
+    }
+
     pub fn stream(&self, track: &Track) -> Result<TrackStream, Error> {
-
-        let song_query = json!({
-            "sng_ids": [track.id.to_string()],
-        });
-
-        let response = self.gw_light_query("song.getListData", song_query)?;
-
-        let result = &response["results"]["data"][0];
-        let track_details = TrackDetails::deserialize(result)?;
 
         let song_quality = 1;
 
-        let url_key = generate_url_key(&track_details, song_quality);
+        let url_key = generate_url_key(track, song_quality);
 
-        let url = format!("https://e-cdns-proxy-{}.dzcdn.net/mobile/1/{}", &track_details.md5_origin[0..1], url_key);
-
-        eprintln!("Url: {}", url);
+        let url = format!("https://e-cdns-proxy-{}.dzcdn.net/mobile/1/{}", &track.md5_origin[0..1], url_key);
 
         let reader = self.agent.get(&url).call().map_err(|err| Error::CannotDownload(err))?.into_reader();
 
-        let blowfish_key = generate_blowfish_key(&track_details);
+        let blowfish_key = generate_blowfish_key(track);
         let blowfish = Blowfish::new_from_slice(blowfish_key.as_bytes()).expect("Invalid key for Blowfish");
 
         Ok(TrackStream {
             reader,
             blowfish,
-            iv: *b"\x00\x01\x02\x03\x04\x05\x06\x07", // magic iv value
             count: 0,
             storage: ArrayVec::default(),
         })
 
     }
 
-    pub fn end(self) -> DeezerAuth<String> {
+    pub fn end(self) -> Credentials<String> {
 
         drop(self.agent);
 
@@ -207,7 +201,7 @@ impl Session {
 
 }
 
-fn generate_blowfish_key(track_details: &TrackDetails) -> String {
+fn generate_blowfish_key(track_details: &Track) -> String {
 
     let key = b"g4el58wc0zvf9na1";
 
@@ -226,7 +220,7 @@ fn generate_blowfish_key(track_details: &TrackDetails) -> String {
 
 }
 
-fn generate_url_key(track_details: &TrackDetails, quality: usize) -> String {
+fn generate_url_key(track_details: &Track, quality: usize) -> String {
 
     let mut data = Vec::new(); // todo: use smallvec / tinyvec
 
@@ -253,8 +247,6 @@ fn generate_url_key(track_details: &TrackDetails, quality: usize) -> String {
         data_full.extend(repeat(b'\0').take(16 - missing))
     }
     
-    assert!(data_full.len() % 16 == 0);
-
     let key = b"jo6aey6haid2Teih";
     let cipher = aes::Aes128Enc::new(key.into());
 
@@ -271,7 +263,6 @@ fn generate_url_key(track_details: &TrackDetails, quality: usize) -> String {
 pub struct TrackStream {
     reader: Box<dyn Read>,
     blowfish: Blowfish,
-    iv: [u8; 8],
     count: usize,
     storage: ArrayVec<[u8; 2048]>,
 }
@@ -280,49 +271,97 @@ impl Read for TrackStream {
 
     fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
 
+        // good luck understanding this
+
         let mut dest = SliceVec::from(buff);
         dest.clear();
 
         let len = dest.capacity();
+        let bytes_read;
 
-        // if we have more bytes stored then requested: write 'em all
+        // if we have more bytes stored then requested just return them
+        // and shrink the storage
         if len <= self.storage.len() {
             dest.extend(self.storage.drain(..len));
             return Ok(len);
         }
 
+
+        // calculate how many bytes we need to read after using 
+        // the stored ones
         let new_len = len - self.storage.len();
+
+        // calculate how many bytes we need to read in order to always
+        // read on a 2048 byte block boundry
         let to_read = new_len + (2048 - new_len % 2048);
 
         dest.extend(self.storage.drain(..));
 
-        let mut raw_bytes = vec![0; to_read];
-        match self.reader.read_exact(&mut raw_bytes) {
-            Ok(..) => (),
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
-            Err(err) => return Err(err)
+        // read the data, if there is less data on the reader left then
+        // requested, this block is not encrypted
+        let mut data = vec![0; to_read];
+        match try_read_exact(&mut self.reader, &mut data) {
+            ReadExact::Ok => bytes_read = len,
+            ReadExact::Eof(val) => bytes_read = val,
+            ReadExact::Err(err) => return Err(err),
         };
 
-        for chunk in raw_bytes.chunks_exact_mut(2048) {
-            if self.count % 3 == 0 {
+        // decrypt all blocks that need to be decrypted
+        for chunk in data.chunks_mut(2048) {
+            if chunk.len() == 2048 && self.count % 3 == 0 {
+                // note: this is a manual implementation of blowfish cbc mode
+                // (took way too long to figure out)
+                let mut cbc_xor = *b"\x00\x01\x02\x03\x04\x05\x06\x07"; // magic iv
+                let mut block_copy = [0; 8];
                 for block in chunk.chunks_exact_mut(8) {
+                    block_copy.copy_from_slice(block);
                     self.blowfish.decrypt_block(GenericArray::from_mut_slice(block));
-                    for (byte, iv) in zip(block, self.iv) {
-                        *byte ^= iv;
-                    }
+                    zip(block.iter_mut(), cbc_xor).for_each(|(byte, val)| *byte ^= val);
+                    cbc_xor = block_copy;
                 }
             }
             self.count += 1;
         }
 
-        dest.extend(raw_bytes.drain(..new_len));
+        if bytes_read >= new_len {
+            dest.extend(data.drain(..new_len));
+            self.storage.extend(data);
+        } else {
+            dest.extend(data.drain(..bytes_read));
+        }
 
-        self.storage.extend(raw_bytes);
-
-        Ok(len)
+        Ok(bytes_read)
 
     }
 
+}
+
+/// Basically the implementation from std but modified to return the number
+/// of bytes that were read on EOF.
+fn try_read_exact(mut this: impl Read, mut buff: &mut [u8]) -> ReadExact {
+    let original_len = buff.len();
+    while !buff.is_empty() {
+        match this.read(buff) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                let temp = buff;
+                buff = &mut temp[bytes_read..];
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return ReadExact::Err(err),
+        }
+    }
+    if !buff.is_empty() {
+        ReadExact::Eof(original_len - buff.len())
+    } else {
+        ReadExact::Ok
+    }
+}
+
+enum ReadExact {
+    Ok,
+    Eof(usize),
+    Err(io::Error),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -339,12 +378,6 @@ pub struct Track {
     pub id: u64,
     #[serde(rename = "SNG_TITLE")]
     pub name: String,
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-pub(crate) struct TrackDetails {
-    #[serde(rename = "SNG_ID", deserialize_with = "str_to_u64")]
-    pub id: u64,
     #[serde(rename = "MD5_ORIGIN")]
     pub md5_origin: String,
     #[serde(rename = "MEDIA_VERSION", deserialize_with = "str_to_u64")]

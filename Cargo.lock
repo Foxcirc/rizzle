@@ -174,6 +174,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dizzle"
+version = "0.1.0"
+dependencies = [
+ "alsa",
+ "anyhow",
+ "minimp3",
+ "rizzle",
+ "wav",
+]
+
+[[package]]
 name = "flate2"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -366,6 +377,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "riff"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9b1a3d5f46d53f4a3478e2be4a5a5ce5108ea58b100dcd139830eae7f79a3a1"
+
+[[package]]
 name = "ring"
 version = "0.16.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -394,16 +411,6 @@ dependencies = [
  "serde_json",
  "tinyvec",
  "ureq",
-]
-
-[[package]]
-name = "rizzler"
-version = "0.1.0"
-dependencies = [
- "alsa",
- "anyhow",
- "minimp3",
- "rizzle",
 ]
 
 [[package]]
@@ -678,6 +685,15 @@ name = "wasm-bindgen-shared"
 version = "0.2.86"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed9d5b4305409d1fc9482fee2d7f9bcbf24b3972bf59817ef757e23982242a93"
+
+[[package]]
+name = "wav"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a65e199c799848b4f997072aa4d673c034f80f40191f97fe2f0a23f410be1609"
+dependencies = [
+ "riff",
+]
 
 [[package]]
 name = "web-sys"
