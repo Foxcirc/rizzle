@@ -1,5 +1,5 @@
 [package]
-name = "rizzler"
+name = "dizzle"
 version = "0.1.0"
 edition = "2021"
 description = "Fast no-javascript Deezer Client made with Egui"
