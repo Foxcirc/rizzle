@@ -1,3 +1,2 @@
 target
-Cargo.lock
-dizzle/Cargo.lock
+*.lock
