@@ -9,30 +9,24 @@ mod test;
 
 mod error;
 mod util;
+mod decrypt;
 
-use blowfish::Blowfish;
-use cipher::{KeyInit, BlockEncrypt, BlockDecrypt};
-use generic_array::GenericArray;
-use serde::Deserialize;
+use serde_derive::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tinyvec::{ArrayVec, SliceVec};
-use util::OptionToResult;
-
-use std::{sync::{Arc, Mutex}, iter::{repeat, zip}, io::{Read, self}};
 
 use error::Error;
+use util::OptionToResult;
+use decrypt::*;
 
-#[derive(Clone)]
 pub(crate) struct AuthMiddleware {
     pub(crate) user_agent: String,
-    pub(crate) info: Arc<Mutex<Credentials<String>>>,
+    pub(crate) info: CredentialsPartial,
 }
 
 impl ureq::Middleware for AuthMiddleware {
 
     fn handle(&self, request: ureq::Request, next: ureq::MiddlewareNext) -> Result<ureq::Response, ureq::Error> {
-
-        let info = self.info.lock().expect("todo: lock failed");
 
         next.handle(
             request
@@ -41,7 +35,7 @@ impl ureq::Middleware for AuthMiddleware {
                 .set("User-Agent", &self.user_agent)
                 .set("Connection", "keep-alive")
                 .set("DNT", "1")
-                .set("Cookie", &format!("sid={}; arl={}", info.sid, info.arl))
+                .set("Cookie", &format!("sid={}; arl={}", self.info.sid, self.info.arl))
         )
 
     }
@@ -49,56 +43,49 @@ impl ureq::Middleware for AuthMiddleware {
 }
 
 #[derive(Debug)]
-pub struct Credentials<T> {
-    pub sid: T,
-    pub arl: T,
+pub(crate) struct CredentialsPartial {
+    pub sid: String,
+    pub arl: String,
+}
+
+#[derive(Debug)]
+pub struct Credentials {
+    pub sid: String,
+    pub arl: String,
+    pub api_token: String,
 }
 
 pub struct Session {
     agent: ureq::Agent,
-    info: Arc<Mutex<Credentials<String>>>,
     api_token: String,
 }
 
 impl Session {
 
-    pub fn new<T: AsRef<str>>(info: Credentials<T>) -> Result<Self, Error> {
+    pub fn new(cred: Credentials) -> Self {
 
-        let info = Arc::new(Mutex::new(Credentials {
-            sid: info.sid.as_ref().to_string(),
-            arl: info.arl.as_ref().to_string(),
-        }));
+        let info = CredentialsPartial {
+            sid: cred.sid.clone(),
+            arl: cred.arl.clone(),
+        };
 
         let middleware = AuthMiddleware {
             user_agent: "Rizzle".to_string(),
-            info: Arc::clone(&info)
+            info,
         };
 
         let agent = ureq::AgentBuilder::new()
             .middleware(middleware)
             .build();
 
-        let mut session = Self {
+        Self {
             agent,
-            info,
-            api_token: "".to_string(),
-        };
-
-        // get the session id and api token from deezer
-        // so we can use the full gw-light api
-
-        let result = session.gw_light_query("deezer.getUserData", json!({}))?;
-        let api_token = result["results"]["checkForm"].as_str().some()?.to_string();
-
-        session.api_token = api_token;
-
-        Ok(session)
+            api_token: cred.api_token,
+        }
             
     }
 
-    pub fn search(&self, query: &str) -> Result<Outcome, Error> {
-
-        let mut outcome = Outcome::default();
+    pub fn search(&mut self, query: &str) -> Result<SearchResult, Error> {
 
         let response = self.gw_light_query("deezer.pageSearch", json!({
             "query": query,
@@ -109,79 +96,86 @@ impl Session {
             "top_tracks": true
         }))?;
 
-        // todo: make this all an Outcome::deserialize
+        let result = &response["results"];
+
+        let search_result = Deserialize::deserialize(result)?;
+        
+        Ok(search_result)
+
+    }
+
+    pub fn details<'de, D: Details<'de>>(&mut self, item: &D) -> Result<D::Output, Error> {
+
+        let query = item.details_query();
+        let response = self.gw_light_query(query.method, query.body)?;
 
         let result = &response["results"];
 
-        let is_corrected = result["AUTOCORRECT"].as_bool().some()?;
-        if is_corrected {
-            outcome.corrected = Some(result["REVISED_QUERY"].as_str().some()?.to_string());
-        }
+        let details = D::Output::deserialize(result)?;
 
-        let top = result["TOP_RESULT"].as_array().some()?;
-        if let Some(elem) = top.get(0) {
-            let artist = Artist::deserialize(elem)?;
-            outcome.top = Some(artist);
-        }
-
-        let tracks = result["TRACK"]["data"].as_array().some()?;
-        for elem in tracks {
-            let track = Track::deserialize(elem)?;
-            outcome.tracks.push(track);
-        }
-
-        let artists = result["ARTIST"]["data"].as_array().some()?;
-        for elem in artists {
-            let artist = Artist::deserialize(elem)?;
-            outcome.artists.push(artist);
-        }
-        
-        Ok(outcome)
-
-    }
-
-    pub fn details(artist: &Artist) -> Result<(), Error> {
-
-        Ok(())
+        Ok(details)
         
     }
 
-    pub fn stream(&self, track: &Track) -> Result<TrackStream, Error> {
+    pub fn stream_mp3(&self, track: &Track) -> Result<Mp3Stream, Error> {
 
         let song_quality = 1;
 
         let url_key = generate_url_key(track, song_quality);
+        let blowfish_key = generate_blowfish_key(track);
 
         let url = format!("https://e-cdns-proxy-{}.dzcdn.net/mobile/1/{}", &track.md5_origin[0..1], url_key);
-
         let reader = self.agent.get(&url).call().map_err(|err| Error::CannotDownload(err))?.into_reader();
 
-        let blowfish_key = generate_blowfish_key(track);
-        let blowfish = Blowfish::new_from_slice(blowfish_key.as_bytes()).expect("Invalid key for Blowfish");
-
-        Ok(TrackStream {
-            reader,
-            blowfish,
-            count: 0,
-            storage: ArrayVec::default(),
-        })
+        Ok(Mp3Stream::new(reader, blowfish_key.as_bytes()))
 
     }
 
-    pub fn end(self) -> Credentials<String> {
+
+    #[cfg(feature = "decode")]
+    pub fn stream_raw(&self, track: &Track) -> Result<RawStream, Error> {
+
+        let stream = self.stream_mp3(track)?;
+        Ok(RawStream::new(stream))
+
+    }
+
+    pub fn end(self) -> String {
 
         drop(self.agent);
 
-        let info = Arc::try_unwrap(self.info)
-            .expect("Can't destroy `info` Arc")
-            .into_inner()
-            .expect("Can't destroy `info` Mutex");
-
-        info
+        self.api_token // todo: make it of type ApiToken(String) to better visualize it
 
     }
 
-    fn gw_light_query(&self, method: &str, body: Value) -> Result<Value, Error> {
+    fn gw_light_query(&mut self, method: &str, body: Value) -> Result<Value, Error> {
+
+        let mut result = self.gw_light_query_raw(method, &body)?;
+
+        // If we get a CSRF error the Api token may be out of date
+        if has_csrf_token_error(&result) {
+
+            // Update the Api token
+            // note: the license_token is present in the getUserData request USER/OPTIONS field
+            // it is used for streaming hq songs with a paid acc I LOVE MY LIFE I FOUND IT GOD YEA
+            // note: it has an expiration timestamp
+            let user_data = self.gw_light_query("deezer.getUserData", json!({}))?;
+            let api_token = user_data["results"]["checkForm"].as_str().some()?.to_string();
+            self.api_token = api_token;
+
+            result = self.gw_light_query_raw(method, &body)?;
+
+            if has_csrf_token_error(&result) {
+                return Err(Error::InvalidCredentials)
+            }
+
+        }
+
+        Ok(result)
+
+    }
+
+    fn gw_light_query_raw(&self, method: &str, body: &Value) -> Result<Value, Error> {
 
         let body_str = body.to_string();
 
@@ -190,7 +184,7 @@ impl Session {
             .query("input", "3")
             .query("api_version", "1.0")
             .query("api_token", &self.api_token)
-            .query("cid", "943306354") // Math.floor(1000000000 * Math.random())
+            .query("cid", "943306354") // deezer source: Math.floor(1000000000 * Math.random())
             .set("Content-Length", &body_str.len().to_string())
             .send_string(&body_str)?
             .into_json()?;
@@ -201,199 +195,125 @@ impl Session {
 
 }
 
-fn generate_blowfish_key(track_details: &Track) -> String {
-
-    let key = b"g4el58wc0zvf9na1";
-
-    let id_md5 = md5::compute(track_details.id.to_string().as_bytes());
-    let id_md5_str = hex::encode(id_md5.0);
-    let id_md5_bytes = id_md5_str.as_bytes();
-
-    let mut result = String::with_capacity(16);
-
-    for idx in 0..16 {
-        let value = id_md5_bytes[idx] ^ id_md5_bytes[idx + 16] ^ key[idx];
-        result.push(value as char);
-    }
-
-    result
-
+fn has_csrf_token_error(value: &Value) -> bool {
+        value["error"].as_object().filter(|obj| obj["VALID_TOKEN_REQUIRED"].as_str() == Some("Invalid CSRF token")).is_some()
 }
 
-fn generate_url_key(track_details: &Track, quality: usize) -> String {
-
-    let mut data = Vec::new(); // todo: use smallvec / tinyvec
-
-    data.extend_from_slice(track_details.md5_origin.as_bytes());
-    data.extend_from_slice(b"\xa4");
-    data.extend_from_slice(quality.to_string().as_bytes());
-    data.extend_from_slice(b"\xa4");
-    data.extend_from_slice(track_details.id.to_string().as_bytes());
-    data.extend_from_slice(b"\xa4");
-    data.extend_from_slice(track_details.media_version.to_string().as_bytes());
-
-    let data_md5 = md5::compute(&data);
-    let data_md5_str = hex::encode(data_md5.0);
-
-    let mut data_full = Vec::new(); // todo: use smallvec / tinyvec
-
-    data_full.extend_from_slice(data_md5_str.as_bytes());
-    data_full.extend_from_slice(b"\xa4");
-    data_full.extend_from_slice(&data);
-    data_full.extend_from_slice(b"\xa4");
-
-    let missing = data_full.len() % 16;
-    if missing != 0 {
-        data_full.extend(repeat(b'\0').take(16 - missing))
-    }
-    
-    let key = b"jo6aey6haid2Teih";
-    let cipher = aes::Aes128Enc::new(key.into());
-
-    for block in data_full.chunks_mut(16).map(|chunk| chunk.into()) {
-        cipher.encrypt_block(block);
-    }
-
-    let encoded = hex::encode(data_full);
-
-    return encoded
-
+pub struct DetailsQuery {
+    pub(crate) method: &'static str,
+    pub(crate) body: serde_json::Value,
 }
 
-pub struct TrackStream {
-    reader: Box<dyn Read>,
-    blowfish: Blowfish,
-    count: usize,
-    storage: ArrayVec<[u8; 2048]>,
+pub trait Details<'de> {
+    type Output: Deserialize<'de> + DeserializeOwned;
+    fn details_query(&self) -> DetailsQuery;
 }
 
-impl Read for TrackStream {
-
-    fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
-
-        // good luck understanding this
-
-        let mut dest = SliceVec::from(buff);
-        dest.clear();
-
-        let len = dest.capacity();
-        let bytes_read;
-
-        // if we have more bytes stored then requested just return them
-        // and shrink the storage
-        if len <= self.storage.len() {
-            dest.extend(self.storage.drain(..len));
-            return Ok(len);
-        }
-
-
-        // calculate how many bytes we need to read after using 
-        // the stored ones
-        let new_len = len - self.storage.len();
-
-        // calculate how many bytes we need to read in order to always
-        // read on a 2048 byte block boundry
-        let to_read = new_len + (2048 - new_len % 2048);
-
-        dest.extend(self.storage.drain(..));
-
-        // read the data, if there is less data on the reader left then
-        // requested, this block is not encrypted
-        let mut data = vec![0; to_read];
-        match try_read_exact(&mut self.reader, &mut data) {
-            ReadExact::Ok => bytes_read = len,
-            ReadExact::Eof(val) => bytes_read = val,
-            ReadExact::Err(err) => return Err(err),
-        };
-
-        // decrypt all blocks that need to be decrypted
-        for chunk in data.chunks_mut(2048) {
-            if chunk.len() == 2048 && self.count % 3 == 0 {
-                // note: this is a manual implementation of blowfish cbc mode
-                // (took way too long to figure out)
-                let mut cbc_xor = *b"\x00\x01\x02\x03\x04\x05\x06\x07"; // magic iv
-                let mut block_copy = [0; 8];
-                for block in chunk.chunks_exact_mut(8) {
-                    block_copy.copy_from_slice(block);
-                    self.blowfish.decrypt_block(GenericArray::from_mut_slice(block));
-                    zip(block.iter_mut(), cbc_xor).for_each(|(byte, val)| *byte ^= val);
-                    cbc_xor = block_copy;
-                }
-            }
-            self.count += 1;
-        }
-
-        if bytes_read >= new_len {
-            dest.extend(data.drain(..new_len));
-            self.storage.extend(data);
-        } else {
-            dest.extend(data.drain(..bytes_read));
-        }
-
-        Ok(bytes_read)
-
-    }
-
-}
-
-/// Basically the implementation from std but modified to return the number
-/// of bytes that were read on EOF.
-fn try_read_exact(mut this: impl Read, mut buff: &mut [u8]) -> ReadExact {
-    let original_len = buff.len();
-    while !buff.is_empty() {
-        match this.read(buff) {
-            Ok(0) => break,
-            Ok(bytes_read) => {
-                let temp = buff;
-                buff = &mut temp[bytes_read..];
-            }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-            Err(err) => return ReadExact::Err(err),
+impl<'de> Details<'de> for Artist {
+    type Output = ArtistDetails;
+    fn details_query(&self) -> DetailsQuery {
+        DetailsQuery {
+            method: "deezer.pageArtist",
+            body: json!({"art_id": self.id.to_string(), "lang": "en", "tab": 0})
         }
     }
-    if !buff.is_empty() {
-        ReadExact::Eof(original_len - buff.len())
-    } else {
-        ReadExact::Ok
+}
+
+impl<'de> Details<'de> for Album {
+    type Output = AlbumDetails;
+    fn details_query(&self) -> DetailsQuery {
+        DetailsQuery {
+            method: "deezer.pageAlbum",
+            body: json!({"alb_id": self.id.to_string(), "header": true, "lang": "en", "tab": 0})
+        }
     }
 }
 
-enum ReadExact {
-    Ok,
-    Eof(usize),
-    Err(io::Error),
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Outcome {
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SearchResult {
+    #[serde(rename = "TOP_RESULT", deserialize_with = "des_array_to_option")]
     pub top: Option<Artist>,
+    #[serde(rename = "TRACK", deserialize_with = "des_after_data")]
     pub tracks: Vec<Track>,
+    #[serde(rename = "ARTIST", deserialize_with = "des_after_data")]
     pub artists: Vec<Artist>,
-    pub corrected: Option<String>,
+    #[serde(rename = "ALBUM", deserialize_with = "des_after_data")]
+    pub albums: Vec<Album>,
+    #[serde(default, rename = "REVISED_QUERY")]
+    pub revised_query: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Track {
-    #[serde(rename = "SNG_ID", deserialize_with = "str_to_u64")]
+    #[serde(rename = "SNG_ID", deserialize_with = "des_parse_str")]
     pub id: u64,
     #[serde(rename = "SNG_TITLE")]
     pub name: String,
+    #[serde(rename = "ARTISTS")]
+    pub artists: Vec<Artist>,
     #[serde(rename = "MD5_ORIGIN")]
-    pub md5_origin: String,
-    #[serde(rename = "MEDIA_VERSION", deserialize_with = "str_to_u64")]
-    pub media_version: u64,
+    md5_origin: String,
+    #[serde(rename = "MEDIA_VERSION", deserialize_with = "des_parse_str")]
+    media_version: u64,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Artist {
-    #[serde(rename = "ART_ID", deserialize_with = "str_to_u64")]
+    #[serde(rename = "ART_ID", deserialize_with = "des_parse_str")]
     pub id: u64,
     #[serde(rename = "ART_NAME")]
     pub name: String,
 }
 
-fn str_to_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-    let s: &str = Deserialize::deserialize(deserializer)?;
-    Ok(s.parse::<u64>().unwrap())
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct ArtistDetails {
+    #[serde(rename = "ALBUMS", deserialize_with = "des_after_data")]
+    pub albums: Vec<Album>,
+    #[serde(rename = "TOP", deserialize_with = "des_after_data")]
+    pub top_tracks: Vec<Track>,
+    // #[serde(rename = "HIGHLIGHT", flatten)]
+    // pub highlight: Highlights,
+    #[serde(rename = "RELATED_ARTISTS", deserialize_with = "des_after_data")]
+    pub related: Vec<Artist>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Album {
+    #[serde(rename = "ALB_ID", deserialize_with = "des_parse_str")]
+    pub id: u64,
+    #[serde(rename = "ALB_TITLE")]
+    pub name: String,
+    #[serde(rename = "PHYSICAL_RELEASE_DATE")]
+    pub date: String,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct AlbumDetails {
+    #[serde(rename = "SONGS", deserialize_with = "des_after_data")]
+    pub tracks: Vec<Track>,
+}
+
+fn des_parse_str<'de, D: serde::Deserializer<'de>, T: std::str::FromStr>(deserializer: D) -> Result<T, D::Error> {
+    let string: String = Deserialize::deserialize(deserializer)?;
+    let res = match string.parse() {
+        Ok(val) => val,
+        Err(..) => return Err(serde::de::Error::invalid_value(serde::de::Unexpected::Other(&string), &&format!("string, parsable as {}", std::any::type_name::<T>())[..]))
+    };
+    Ok(res)
+}
+
+fn des_after_data<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(deserializer: D) -> Result<T, D::Error> {
+    let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
+    let data = &value["data"];
+    serde_json::from_value(data.to_owned()).map_err(serde::de::Error::custom)
+}
+
+fn des_array_to_option<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(deserializer: D) -> Result<Option<T>, D::Error> {
+    let mut array: Vec<serde_json::Value> = Deserialize::deserialize(deserializer)?;
+    let elem = array.drain(..).next();
+    match elem {
+        Some(value) => Ok(Some(serde_json::from_value(value).map_err(serde::de::Error::custom)?)),
+        None => Ok(None),
+    }
 }
 

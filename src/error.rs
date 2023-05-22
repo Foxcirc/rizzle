@@ -1,5 +1,5 @@
 
-use std::{fmt::{self, Display}, io};
+use std::{fmt, io};
 
 use crate::util::OptionError;
 
@@ -7,17 +7,21 @@ use crate::util::OptionError;
 pub enum Error {
     IoError(io::Error),
     NetworkError(ureq::Error),
-    InvalidResponse,
+    InvalidResponse(serde_json::Error),
+    UnknownInvalidResponse,
     CannotDownload(ureq::Error),
+    InvalidCredentials,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IoError(value) => Display::fmt(value, f),
-            Self::NetworkError(value) => Display::fmt(value, f),
-            Self::CannotDownload(value) => Display::fmt(value, f),
-            Self::InvalidResponse => f.write_str("Invalid response"),
+            Self::IoError(value) => write!(f, "IoError: {}", value),
+            Self::NetworkError(value) => write!(f, "NetworkError: {}", value),
+            Self::CannotDownload(value) => write!(f, "CannotDownload: {}", value),
+            Self::InvalidResponse(value) => write!(f, "InvalidResponse: {}", value),
+            Self::UnknownInvalidResponse => write!(f, "UnknownInvalidResponse"),
+            Self::InvalidCredentials => write!(f, "InvalidCredentials"),
         }
     }
 }
@@ -37,14 +41,14 @@ impl From<ureq::Error> for Error {
 }
 
 impl From<serde_json::Error> for Error {
-    fn from(_: serde_json::Error) -> Self {
-        Self::InvalidResponse
+    fn from(value: serde_json::Error) -> Self {
+        Self::InvalidResponse(value)
     }
 }
 
 impl From<OptionError<'_>> for Error {
     fn from(_: OptionError) -> Self {
-        Self::InvalidResponse
+        Self::UnknownInvalidResponse
     }
 }
 
