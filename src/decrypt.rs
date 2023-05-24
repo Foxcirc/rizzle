@@ -220,7 +220,8 @@ impl Read for RawStream {
             let frame = match self.decoder.next_frame() {
                 Ok(value) => value,
                 Err(minimp3::Error::Eof) => break,
-                Err(_other) => panic!("todo: add error handling here (mp3 decoding failed)"),
+                Err(minimp3::Error::Io(err)) => return Err(err),
+                Err(other) => return Err(io::Error::new(io::ErrorKind::Other, format!("Error during mp3 decoding: {}", other))),
             };
 
             samples_read += frame.data.len();

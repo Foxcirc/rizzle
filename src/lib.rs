@@ -87,7 +87,7 @@ impl Session {
 
     pub fn search(&mut self, query: &str) -> Result<SearchResult, Error> {
 
-        let response = self.gw_light_query("deezer.pageSearch", json!({
+        let result = self.gw_light_query("deezer.pageSearch", json!({
             "query": query,
             "start": 0,
             "nb": 40,
@@ -95,8 +95,6 @@ impl Session {
             "artist_suggest": true,
             "top_tracks": true
         }))?;
-
-        let result = &response["results"];
 
         let search_result = Deserialize::deserialize(result)?;
         
@@ -107,9 +105,7 @@ impl Session {
     pub fn details<'de, D: Details<'de>>(&mut self, item: &D) -> Result<D::Output, Error> {
 
         let query = item.details_query();
-        let response = self.gw_light_query(query.method, query.body)?;
-
-        let result = &response["results"];
+        let result = self.gw_light_query(query.method, query.body)?;
 
         let details = D::Output::deserialize(result)?;
 
@@ -144,32 +140,34 @@ impl Session {
 
         drop(self.agent);
 
-        self.api_token // todo: make it of type ApiToken(String) to better visualize it
+        self.api_token
 
     }
 
     fn gw_light_query(&mut self, method: &str, body: Value) -> Result<Value, Error> {
 
-        let mut result = self.gw_light_query_raw(method, &body)?;
+        let mut response = self.gw_light_query_raw(method, &body)?;
 
         // If we get a CSRF error the Api token may be out of date
-        if has_csrf_token_error(&result) {
+        if has_csrf_token_error(&response) {
 
             // Update the Api token
             // note: the license_token is present in the getUserData request USER/OPTIONS field
             // it is used for streaming hq songs with a paid acc I LOVE MY LIFE I FOUND IT GOD YEA
             // note: it has an expiration timestamp
             let user_data = self.gw_light_query("deezer.getUserData", json!({}))?;
-            let api_token = user_data["results"]["checkForm"].as_str().some()?.to_string();
+            let api_token = user_data["checkForm"].as_str().some()?.to_string();
             self.api_token = api_token;
 
-            result = self.gw_light_query_raw(method, &body)?;
+            response = self.gw_light_query_raw(method, &body)?;
 
-            if has_csrf_token_error(&result) {
+            if has_csrf_token_error(&response) {
                 return Err(Error::InvalidCredentials)
             }
 
         }
+
+        let result = response["results"].take();
 
         Ok(result)
 
