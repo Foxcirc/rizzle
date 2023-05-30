@@ -10,21 +10,22 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     let cred_str = fs::read_to_string("credentials")?;
-    let cred_lines: Vec<&str> = cred_str.lines().take(3).collect();
+    let cred_lines: Vec<&str> = cred_str.lines().take(2).collect();
 
     let credentials = rizzle::Credentials {
         sid: cred_lines[0].to_string(),
         arl: cred_lines[1].to_string(),
-        api_token: cred_lines[2].to_string(),
     };
 
-    let mut session = rizzle::Session::new(credentials);
+    let session = rizzle::Session::new(credentials)?;
 
     let result = session.search(&args[1])?;
 
     let track = &result.tracks[0];
     println!("Streaming {:?}", track.name);
     println!("Artist {:?}", track.artists[0].name);
+
+    let lyrics = session.details(track)?;
 
     let details = session.details(&track.artists[0])?;
     println!(" -> Total Albums: {}", details.albums.len());
@@ -57,17 +58,6 @@ fn main() -> anyhow::Result<()> {
 
     pcm.drain()?;
 
-    let api_token = session.end();
-    
-    let mut content = fs::read_to_string("credentials")?;
-    for (idx, line) in content.clone().lines().enumerate() {
-        if idx == 3 {
-            content = content.replace(line, &api_token);
-        }
-    }
-
-    fs::write("credentials", content)?;
-    
     Ok(())
 
 }

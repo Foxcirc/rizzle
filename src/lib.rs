@@ -11,22 +11,26 @@ mod error;
 mod util;
 mod decrypt;
 
+use std::sync::{Arc, Mutex};
+
 use serde_derive::Deserialize;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, de::DeserializeOwned, Deserializer};
 use serde_json::{Value, json};
 
 use error::Error;
-use util::OptionToResult;
 use decrypt::*;
 
 pub(crate) struct AuthMiddleware {
     pub(crate) user_agent: String,
-    pub(crate) info: CredentialsPartial,
+    pub(crate) info: Credentials,
+    pub(crate) license_token: Arc<Mutex<String>>,
 }
 
 impl ureq::Middleware for AuthMiddleware {
 
     fn handle(&self, request: ureq::Request, next: ureq::MiddlewareNext) -> Result<ureq::Response, ureq::Error> {
+
+        let license_token = self.license_token.lock().expect("Cannot lock `license_token Mutex");
 
         next.handle(
             request
@@ -35,7 +39,7 @@ impl ureq::Middleware for AuthMiddleware {
                 .set("User-Agent", &self.user_agent)
                 .set("Connection", "keep-alive")
                 .set("DNT", "1")
-                .set("Cookie", &format!("sid={}; arl={}", self.info.sid, self.info.arl))
+                .set("Cookie", &format!("sid={}; arl={}; license_token={}", self.info.sid, self.info.arl, license_token))
         )
 
     }
@@ -43,49 +47,49 @@ impl ureq::Middleware for AuthMiddleware {
 }
 
 #[derive(Debug)]
-pub(crate) struct CredentialsPartial {
-    pub sid: String,
-    pub arl: String,
-}
-
-#[derive(Debug)]
 pub struct Credentials {
     pub sid: String,
     pub arl: String,
-    pub api_token: String,
 }
 
 pub struct Session {
     agent: ureq::Agent,
-    api_token: String,
+    user: User,
 }
 
 impl Session {
 
-    pub fn new(cred: Credentials) -> Self {
+    pub fn new(info: Credentials) -> Result<Self, Error> {
 
-        let info = CredentialsPartial {
-            sid: cred.sid.clone(),
-            arl: cred.arl.clone(),
-        };
+        let license_token = Arc::new(Mutex::new("".to_string()));
 
         let middleware = AuthMiddleware {
             user_agent: "Rizzle".to_string(),
             info,
+            license_token: Arc::clone(&license_token),
         };
 
         let agent = ureq::AgentBuilder::new()
             .middleware(middleware)
             .build();
 
-        Self {
+        let user_raw = Self::gw_light_query_raw(&agent, "", "deezer.getUserData", json!({}))?;
+        let user: User = Deserialize::deserialize(user_raw)?;
+
+        *license_token.lock().expect("Cannot lock `license_token` Mutex") = user.license_token.clone();
+
+        Ok(Self {
             agent,
-            api_token: cred.api_token,
-        }
+            user,
+        })
             
     }
 
-    pub fn search(&mut self, query: &str) -> Result<SearchResult, Error> {
+    pub fn user(&self) -> Result<User, Error> {
+        Ok(Clone::clone(&self.user))
+    }
+
+    pub fn search(&self, query: &str) -> Result<SearchResult, Error> {
 
         let result = self.gw_light_query("deezer.pageSearch", json!({
             "query": query,
@@ -102,12 +106,15 @@ impl Session {
 
     }
 
-    pub fn details<'de, D: Details<'de>>(&mut self, item: &D) -> Result<D::Output, Error> {
+    pub fn details<'de, O: Deserialize<'de>, D: Details<'de, O>>(&self, item: &D) -> Result<O, Error> {
 
         let query = item.details_query();
-        let result = self.gw_light_query(query.method, query.body)?;
+        let result = match query.api {
+            DetailsApi::GwLightApi(method) => self.gw_light_query(method, query.body)?,
+            DetailsApi::PipeApi => self.pipe_query(query.body)?,
+        };
 
-        let details = D::Output::deserialize(result)?;
+        let details = O::deserialize(result)?;
 
         Ok(details)
         
@@ -136,35 +143,46 @@ impl Session {
 
     }
 
-    pub fn end(self) -> String {
+    fn pipe_query(&self, body: Value) -> Result<Value, Error> {
+        Self::pipe_query_raw(&self.agent, body)
+    }
 
-        drop(self.agent);
+    fn pipe_query_raw(agent: &ureq::Agent, body: Value) -> Result<Value, Error> {
+        
+        let body_str = body.to_string();
 
-        self.api_token
+        let mut response: Value = agent.post("https://pipe.deezer.com/api")
+            .set("Content-Length", &body_str.len().to_string())
+            .send_string(&body_str)?
+            .into_json()?;
+
+        let result = response["data"].take();
+
+        Ok(result)
 
     }
 
-    fn gw_light_query(&mut self, method: &str, body: Value) -> Result<Value, Error> {
+    fn gw_light_query(&self, method: &str, body: Value) -> Result<Value, Error> {
+        Self::gw_light_query_raw(&self.agent, &self.user.api_token, method, body)
+    }
 
-        let mut response = self.gw_light_query_raw(method, &body)?;
+    fn gw_light_query_raw(agent: &ureq::Agent, api_token: &str, method: &str, body: Value) -> Result<Value, Error> {
+
+        let body_str = body.to_string();
+
+        let mut response: Value = agent.post("https://www.deezer.com/ajax/gw-light.php")
+            .query("method", method)
+            .query("input", "3")
+            .query("api_version", "1.0")
+            .query("api_token", api_token)
+            .query("cid", "943306354") // deezer source: Math.floor(1000000000 * Math.random())
+            .set("Content-Length", &body_str.len().to_string())
+            .send_string(&body_str)?
+            .into_json()?;
 
         // If we get a CSRF error the Api token may be out of date
-        if has_csrf_token_error(&response) {
-
-            // Update the Api token
-            // note: the license_token is present in the getUserData request USER/OPTIONS field
-            // it is used for streaming hq songs with a paid acc I LOVE MY LIFE I FOUND IT GOD YEA
-            // note: it has an expiration timestamp
-            let user_data = self.gw_light_query("deezer.getUserData", json!({}))?;
-            let api_token = user_data["checkForm"].as_str().some()?.to_string();
-            self.api_token = api_token;
-
-            response = self.gw_light_query_raw(method, &body)?;
-
-            if has_csrf_token_error(&response) {
-                return Err(Error::InvalidCredentials)
-            }
-
+        if Self::has_csrf_token_error(&response) {
+            return Err(Error::InvalidCredentials)
         }
 
         let result = response["results"].take();
@@ -173,57 +191,154 @@ impl Session {
 
     }
 
-    fn gw_light_query_raw(&self, method: &str, body: &Value) -> Result<Value, Error> {
-
-        let body_str = body.to_string();
-
-        let result: Value = self.agent.post("https://www.deezer.com/ajax/gw-light.php")
-            .query("method", method)
-            .query("input", "3")
-            .query("api_version", "1.0")
-            .query("api_token", &self.api_token)
-            .query("cid", "943306354") // deezer source: Math.floor(1000000000 * Math.random())
-            .set("Content-Length", &body_str.len().to_string())
-            .send_string(&body_str)?
-            .into_json()?;
-
-        Ok(result)
-
+    fn has_csrf_token_error(value: &Value) -> bool {
+        value["error"].as_object().filter(|obj| obj["VALID_TOKEN_REQUIRED"].as_str() == Some("Invalid CSRF token")).is_some()
     }
 
 }
 
-fn has_csrf_token_error(value: &Value) -> bool {
-        value["error"].as_object().filter(|obj| obj["VALID_TOKEN_REQUIRED"].as_str() == Some("Invalid CSRF token")).is_some()
-}
 
 pub struct DetailsQuery {
-    pub(crate) method: &'static str,
+    pub(crate) api: DetailsApi,
     pub(crate) body: serde_json::Value,
 }
 
-pub trait Details<'de> {
-    type Output: Deserialize<'de> + DeserializeOwned;
+pub enum DetailsApi {
+    PipeApi,
+    GwLightApi(&'static str),
+}
+
+pub trait Details<'de, O> {
     fn details_query(&self) -> DetailsQuery;
 }
 
-impl<'de> Details<'de> for Artist {
-    type Output = ArtistDetails;
+impl<'de> Details<'de, ArtistDetails> for Artist {
     fn details_query(&self) -> DetailsQuery {
         DetailsQuery {
-            method: "deezer.pageArtist",
+            api: DetailsApi::GwLightApi("deezer.pageArtist"),
             body: json!({"art_id": self.id.to_string(), "lang": "en", "tab": 0})
         }
     }
 }
 
-impl<'de> Details<'de> for Album {
-    type Output = AlbumDetails;
+impl<'de> Details<'de, AlbumDetails> for Album {
     fn details_query(&self) -> DetailsQuery {
         DetailsQuery {
-            method: "deezer.pageAlbum",
+            api: DetailsApi::GwLightApi("deezer.pageAlbum"),
             body: json!({"alb_id": self.id.to_string(), "header": true, "lang": "en", "tab": 0})
         }
+    }
+}
+
+impl<'de> Details<'de, PlaylistDetails> for Playlist {
+    fn details_query(&self) -> DetailsQuery {
+        DetailsQuery {
+            api: DetailsApi::GwLightApi("deezer.pagePlaylist"), // todo: make "nb" be changable
+            body: json!({ "header": true, "lang": "en", "nb": 2000, "playlist_id": self.id.to_string(), "start": 0, "tab": 0, "tags": true })
+        }
+    }
+}
+
+impl<'de> Details<'de, UserLibrary> for User {
+    fn details_query(&self) -> DetailsQuery {
+        DetailsQuery {
+            api: DetailsApi::GwLightApi("deezer.userMenu"),
+            body: json!({})
+        }
+    }
+}
+
+impl<'de> Details<'de, UserFamily> for User {
+    fn details_query(&self) -> DetailsQuery {
+        DetailsQuery {
+            api: DetailsApi::GwLightApi("deezer.getChildAccounts"),
+            body: json!({})
+        }
+    }
+}
+
+impl<'de> Details<'de, TrackLyrics> for Track {
+    fn details_query(&self) -> DetailsQuery {
+        DetailsQuery {
+            api: DetailsApi::PipeApi,
+            // body: json!({"operationName": "SynchronizedTrackLyrics", "query": "query SynchronizedTrackLyrics($trackId: String!) { track(trackId: $trackId) { ...SynchronizedTrackLyrics } } fragment SynchronizedTrackLyrics on Track { id lyrics { ...Lyrics } } fragment Lyrics on Lyrics { id copyright text writers synchronizedLines { ...LyricsSynchronizedLines } } fragment LyricsSynchronizedLines on LyricsSynchronizedLine { lrcTimestamp line lineTranslated milliseconds duration } ", "variables": { "trackId": self.id.to_string() } }),
+            body: json!({
+                "operationName": "SynchronizedTrackLyrics",
+                "query": "query SynchronizedTrackLyrics($trackId: String!) {\n  track(trackId: $trackId) {\n    ...SynchronizedTrackLyrics\n    __typename\n  }\n}\n\nfragment SynchronizedTrackLyrics on Track {\n  id\n  lyrics {\n    ...Lyrics\n    __typename\n  }\n  album {\n    cover {\n      small: urls(pictureRequest: {width: 100, height: 100})\n      medium: urls(pictureRequest: {width: 264, height: 264})\n      large: urls(pictureRequest: {width: 800, height: 800})\n      explicitStatus\n      __typename\n    }\n    __typename\n  }\n  __typename\n}\n\nfragment Lyrics on Lyrics {\n  id\n  copyright\n  text\n  writers\n  synchronizedLines {\n    ...LyricsSynchronizedLines\n    __typename\n  }\n  __typename\n}\n\nfragment LyricsSynchronizedLines on LyricsSynchronizedLine {\n  lrcTimestamp\n  line\n  lineTranslated\n  milliseconds\n  duration\n  __typename\n}",
+                "variables": {
+                    "trackId": self.id,
+                }
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SmallUser {
+    #[serde(rename = "USER_ID", deserialize_with = "des_parse_str")]
+    pub id: usize,
+    #[serde(rename = "BLOG_NAME")]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UserFamily {
+    pub users: Vec<SmallUser>,
+}
+
+impl<'de> Deserialize<'de> for UserFamily {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value: Value = Deserialize::deserialize(deserializer)?;
+        let mut users = Vec::new();
+        let items = match value.as_array() { Some(val) => val, None => return Err(serde::de::Error::custom("UserFamily: Expected array of users")) };
+        for item in items {
+            users.push(Deserialize::deserialize(item).map_err(|_| serde::de::Error::custom("UserFamily: Not a valid User entry"))?)
+        }
+        Ok(UserFamily { users })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UserLibrary {
+    pub playlists: Vec<Playlist>,
+    pub history: Vec<String>,
+    // todo: add "notifications"
+}
+
+impl<'de> Deserialize<'de> for UserLibrary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value: Value = Deserialize::deserialize(deserializer)?;
+        let playlists = Deserialize::deserialize(value["PLAYLISTS"].take()).map_err(|_| serde::de::Error::missing_field("PLAYLISTS"))?;
+        let history_raw: Vec<Value> = Deserialize::deserialize(value["SEARCH_HISTORY"].take()).map_err(|_| serde::de::Error::missing_field("SEARCH_HISTORY"))?;
+        let mut history = Vec::new();
+        for item in history_raw {
+            history.push(match item["query"].as_str() { Some(val) => val.to_string(), None => return Err(serde::de::Error::missing_field("query")) })
+        }
+        Ok(UserLibrary { playlists, history })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct User {
+    api_token: String,
+    license_token: String,
+    pub id: usize,
+    pub created: String,
+    pub name: String,
+    pub multiaccount: bool,
+
+}
+
+impl<'de> Deserialize<'de> for User {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value: Value = Deserialize::deserialize(deserializer)?;
+        let api_token = match value["checkForm"].as_str() { Some(val) => val.to_string(), None => return Err(serde::de::Error::missing_field("checkForm")) };
+        let license_token = match value["USER"]["OPTIONS"]["license_token"].as_str() { Some(val) => val.to_string(), None => return Err(serde::de::Error::missing_field("license_token")) };
+        let id = match value["USER"]["USER_ID"].as_u64() { Some(val) => val as usize, None => return Err(serde::de::Error::missing_field("USER_ID")) };
+        let created = match value["USER"]["INSCRIPTION_DATE"].as_str() { Some(val) => val.to_string(), None => return Err(serde::de::Error::missing_field("INSCRIPTION_DATE")) };
+        let name = match value["USER"]["BLOG_NAME"].as_str() { Some(val) => val.to_string(), None => return Err(serde::de::Error::missing_field("BLOG_NAME")) };
+        let multiaccount = match value["USER"]["MULTI_ACCOUNT"]["enabled"].as_bool() { Some(val) => val, None => false };
+        Ok(User { api_token, license_token, id, created, name, multiaccount })
     }
 }
 
@@ -237,6 +352,8 @@ pub struct SearchResult {
     pub artists: Vec<Artist>,
     #[serde(rename = "ALBUM", deserialize_with = "des_after_data")]
     pub albums: Vec<Album>,
+    #[serde(rename = "PLAYLIST", deserialize_with = "des_after_data")]
+    pub playlists: Vec<Playlist>,
     #[serde(default, rename = "REVISED_QUERY")]
     pub revised_query: Option<String>,
 }
@@ -253,6 +370,17 @@ pub struct Track {
     md5_origin: String,
     #[serde(rename = "MEDIA_VERSION", deserialize_with = "des_parse_str")]
     media_version: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TrackLyrics {
+
+}
+
+impl<'de> Deserialize<'de> for TrackLyrics {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(TrackLyrics {})
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -282,11 +410,29 @@ pub struct Album {
     #[serde(rename = "ALB_TITLE")]
     pub name: String,
     #[serde(rename = "PHYSICAL_RELEASE_DATE")]
-    pub date: String,
+    pub release_date: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct AlbumDetails {
+    #[serde(rename = "SONGS", deserialize_with = "des_after_data")]
+    pub tracks: Vec<Track>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Playlist {
+    #[serde(rename = "PLAYLIST_ID", deserialize_with = "des_parse_str")]
+    pub id: u64,
+    #[serde(rename = "TITLE")]
+    pub name: String,
+    #[serde(rename = "DATE_MOD")]
+    pub last_modified: String,
+    #[serde(rename = "NB_SONG")]
+    pub songs: usize,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct PlaylistDetails {
     #[serde(rename = "SONGS", deserialize_with = "des_after_data")]
     pub tracks: Vec<Track>,
 }

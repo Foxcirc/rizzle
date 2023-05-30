@@ -12,10 +12,9 @@ fn rizzle_test() {
     let cred = Credentials {
         sid: cred_raw[0].to_string(),
         arl: cred_raw[1].to_string(),
-        api_token: cred_raw[2].to_string(),
     };
     
-    let mut session = Session::new(cred);
+    let session = Session::new(cred).expect("Cannot create new Session");
 
     let result = session.search("Miraie").expect("Cannot search deezer");
 
@@ -26,10 +25,6 @@ fn rizzle_test() {
 
     let album = &result.albums[0];
     let _album_details = session.details(album).expect("Cannot get album details");
-
-    let new_token = session.end();
-
-    assert!(&new_token == &cred_raw[2], "Token changed!")
 
 }
 
