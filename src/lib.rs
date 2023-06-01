@@ -14,11 +14,11 @@ mod decrypt;
 use std::sync::{Arc, Mutex};
 
 use serde_derive::Deserialize;
-use serde::{Deserialize, de::DeserializeOwned, Deserializer};
+use serde::{de::{DeserializeOwned, Deserialize}, Deserializer};
 use serde_json::{Value, json};
 
-use error::Error;
-use decrypt::*;
+pub use error::Error;
+pub use decrypt::*;
 
 pub(crate) struct AuthMiddleware {
     pub(crate) user_agent: String,
@@ -46,7 +46,7 @@ impl ureq::Middleware for AuthMiddleware {
 
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Credentials {
     pub sid: String,
     pub arl: String,
