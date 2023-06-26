@@ -11,75 +11,42 @@ mod error;
 mod util;
 mod decrypt;
 
-use std::sync::{Arc, Mutex};
-
 use serde_derive::Deserialize;
 use serde::{de::{DeserializeOwned, Deserialize}, Deserializer};
-use serde_json::{Value, json};
+use serde_json::{Value as JsonValue, json};
 
 pub use error::Error;
 pub use decrypt::*;
 
-pub(crate) struct AuthMiddleware {
-    pub(crate) user_agent: String,
-    pub(crate) info: Credentials,
-    pub(crate) license_token: Arc<Mutex<String>>,
-}
-
-impl ureq::Middleware for AuthMiddleware {
-
-    fn handle(&self, request: ureq::Request, next: ureq::MiddlewareNext) -> Result<ureq::Response, ureq::Error> {
-
-        let license_token = self.license_token.lock().expect("Cannot lock `license_token Mutex");
-
-        next.handle(
-            request
-                .set("Accept", "*/*")
-                .set("Cache-Control", "no-cache")
-                .set("User-Agent", &self.user_agent)
-                .set("Connection", "keep-alive")
-                .set("DNT", "1")
-                .set("Cookie", &format!("sid={}; arl={}; license_token={}", self.info.sid, self.info.arl, license_token))
-        )
-
-    }
-
-}
-
 #[derive(Debug, Default, Deserialize)]
-pub struct Credentials {
+pub struct UserInfo {
     pub sid: String,
     pub arl: String,
+    #[serde(default)]
+    pub user_agent: String,
 }
 
 pub struct Session {
-    agent: ureq::Agent,
+    client: rtv::SimpleClient,
+    info: UserInfo,
     user: User,
 }
 
 impl Session {
 
-    pub fn new(info: Credentials) -> Result<Self, Error> {
+    pub fn new(info: UserInfo) -> Result<Self, Error> {
 
-        let license_token = Arc::new(Mutex::new("".to_string()));
+        // Todo: If UserInfo is empty, Deezer will automatically use a free account I think
+        // maybe add support for that (no BLOG_NAME will be present etc.)
 
-        let middleware = AuthMiddleware {
-            user_agent: "Rizzle".to_string(),
-            info,
-            license_token: Arc::clone(&license_token),
-        };
+        let mut client = rtv::SimpleClient::new()?;
 
-        let agent = ureq::AgentBuilder::new()
-            .middleware(middleware)
-            .build();
-
-        let user_raw = Self::gw_light_query_raw(&agent, "", "deezer.getUserData", json!({}))?;
+        let user_raw = Self::gw_light_query_raw(&mut client, &info, "", "", "deezer.getUserData", json!({}))?;
         let user: User = Deserialize::deserialize(user_raw)?;
 
-        *license_token.lock().expect("Cannot lock `license_token` Mutex") = user.license_token.clone();
-
         Ok(Self {
-            agent,
+            client,
+            info,
             user,
         })
             
@@ -89,7 +56,7 @@ impl Session {
         Ok(Clone::clone(&self.user))
     }
 
-    pub fn search(&self, query: &str) -> Result<SearchResult, Error> {
+    pub fn search(&mut self, query: &str) -> Result<SearchResult, Error> {
 
         let result = self.gw_light_query("deezer.pageSearch", json!({
             "query": query,
@@ -106,7 +73,7 @@ impl Session {
 
     }
 
-    pub fn details<'de, O: Deserialize<'de>, D: Details<'de, O>>(&self, item: &D) -> Result<O, Error> {
+    pub fn details<'de, O: Deserialize<'de>, D: Details<'de, O>>(&mut self, item: &D) -> Result<O, Error> {
 
         let query = item.details_query();
         let result = match query.api {
@@ -120,78 +87,92 @@ impl Session {
         
     }
 
-    pub fn stream_mp3(&self, track: &Track) -> Result<Mp3Stream, Error> {
+    pub fn stream_mp3<'d>(&'d mut self, track: &Track) -> Result<Mp3Stream<'d>, Error> {
 
         let song_quality = 1;
 
         let url_key = generate_url_key(track, song_quality);
         let blowfish_key = generate_blowfish_key(track);
 
-        let url = format!("https://e-cdns-proxy-{}.dzcdn.net/mobile/1/{}", &track.md5_origin[0..1], url_key);
-        let reader = self.agent.get(&url).call().map_err(|err| Error::CannotDownload(err))?.into_reader();
+        let req = rtv::Request::get().secure()
+            .host(format!("e-cdns-proxy-{}.dzcdn.net", &track.md5_origin[0..1]))
+            .path(format!("/mobile/1/{}", url_key));
 
-        Ok(Mp3Stream::new(reader, blowfish_key.as_bytes()))
+        let resp = self.client.stream(req).map_err(|err| Error::CannotDownload(err))?;
+
+        Ok(Mp3Stream::new(resp.body, blowfish_key.as_bytes()))
 
     }
 
 
     #[cfg(feature = "decode")]
-    pub fn stream_raw(&self, track: &Track) -> Result<RawStream, Error> {
+    pub fn stream_raw<'d>(&'d mut self, track: &Track) -> Result<RawStream<'d>, Error> {
 
         let stream = self.stream_mp3(track)?;
         Ok(RawStream::new(stream))
 
     }
 
-    fn pipe_query(&self, body: Value) -> Result<Value, Error> {
-        Self::pipe_query_raw(&self.agent, body)
+    fn decorate_request(&self, req: rtv::RequestBuilder) -> rtv::RequestBuilder {
+        Self::decorate_request_raw(req, &self.info, &self.user.license_token)
     }
 
-    fn pipe_query_raw(agent: &ureq::Agent, body: Value) -> Result<Value, Error> {
+    fn decorate_request_raw(req: rtv::RequestBuilder, info: &UserInfo, license_token: &str) -> rtv::RequestBuilder {
+        req.set("Accept", "*/*").set("User-Agent", &info.user_agent).set("DNT", "1").set("Cookie", &format!("sid={}; arl={}; license_token={}", info.sid, info.arl, license_token))
+    }
+
+    fn pipe_query(&mut self, body: JsonValue) -> Result<JsonValue, Error> {
         
         let body_str = body.to_string();
 
-        let mut response: Value = agent.post("https://pipe.deezer.com/api")
-            .set("Content-Length", &body_str.len().to_string())
-            .send_string(&body_str)?
-            .into_json()?;
+        let req = rtv::Request::post().secure()
+            .host("pipe.deezer.com")
+            .path("/api")
+            .send_str(body_str);
 
-        let result = response["data"].take();
+        let req = self.decorate_request(req);
+
+        let mut resp = JsonValue::from(self.client.send(req)?.body);
+
+        let result = resp["data"].take();
 
         Ok(result)
 
     }
 
-    fn gw_light_query(&self, method: &str, body: Value) -> Result<Value, Error> {
-        Self::gw_light_query_raw(&self.agent, &self.user.api_token, method, body)
+    fn gw_light_query(&mut self, method: &str, body: JsonValue) -> Result<JsonValue, Error> {
+        Self::gw_light_query_raw(&mut self.client, &self.info, &self.user.api_token, &self.user.license_token, method, body)
     }
 
-    fn gw_light_query_raw(agent: &ureq::Agent, api_token: &str, method: &str, body: Value) -> Result<Value, Error> {
+    fn gw_light_query_raw(client: &mut rtv::SimpleClient, info: &UserInfo, api_token: &str, license_token: &str, method: &str, body: JsonValue) -> Result<JsonValue, Error> {
 
         let body_str = body.to_string();
 
-        let mut response: Value = agent.post("https://www.deezer.com/ajax/gw-light.php")
+        let req = rtv::Request::post().secure()
+            .host("www.deezer.com")
+            .path("/ajax/gw-light.php")
             .query("method", method)
             .query("input", "3")
             .query("api_version", "1.0")
             .query("api_token", api_token)
-            .query("cid", "943306354") // deezer source: Math.floor(1000000000 * Math.random())
-            .set("Content-Length", &body_str.len().to_string())
-            .send_string(&body_str)?
-            .into_json()?;
+            .query("cid", "94330654")
+            .send_str(body_str);
 
-        // If we get a CSRF error the Api token may be out of date
-        if Self::has_csrf_token_error(&response) {
+        let req = Self::decorate_request_raw(req, info, license_token);
+
+        let mut resp = client.send(req)?.into_json()?;
+
+        if Self::has_csrf_token_error(&resp) {
             return Err(Error::InvalidCredentials)
         }
 
-        let result = response["results"].take();
+        let result = resp["results"].take();
 
         Ok(result)
 
     }
 
-    fn has_csrf_token_error(value: &Value) -> bool {
+    fn has_csrf_token_error(value: &JsonValue) -> bool {
         value["error"].as_object().filter(|obj| obj["VALID_TOKEN_REQUIRED"].as_str() == Some("Invalid CSRF token")).is_some()
     }
 
@@ -288,7 +269,7 @@ pub struct UserFamily {
 
 impl<'de> Deserialize<'de> for UserFamily {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value: Value = Deserialize::deserialize(deserializer)?;
+        let value: JsonValue = Deserialize::deserialize(deserializer)?;
         let mut users = Vec::new();
         let items = match value.as_array() { Some(val) => val, None => return Err(serde::de::Error::custom("UserFamily: Expected array of users")) };
         for item in items {
@@ -307,9 +288,9 @@ pub struct UserLibrary {
 
 impl<'de> Deserialize<'de> for UserLibrary {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut value: Value = Deserialize::deserialize(deserializer)?;
+        let mut value: JsonValue = Deserialize::deserialize(deserializer)?;
         let playlists = Deserialize::deserialize(value["PLAYLISTS"].take()).map_err(|_| serde::de::Error::missing_field("PLAYLISTS"))?;
-        let history_raw: Vec<Value> = Deserialize::deserialize(value["SEARCH_HISTORY"].take()).map_err(|_| serde::de::Error::missing_field("SEARCH_HISTORY"))?;
+        let history_raw: Vec<JsonValue> = Deserialize::deserialize(value["SEARCH_HISTORY"].take()).map_err(|_| serde::de::Error::missing_field("SEARCH_HISTORY"))?;
         let mut history = Vec::new();
         for item in history_raw {
             history.push(match item["query"].as_str() { Some(val) => val.to_string(), None => return Err(serde::de::Error::missing_field("query")) })
@@ -331,7 +312,7 @@ pub struct User {
 
 impl<'de> Deserialize<'de> for User {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value: Value = Deserialize::deserialize(deserializer)?;
+        let value: JsonValue = Deserialize::deserialize(deserializer)?;
         let api_token = match value["checkForm"].as_str() { Some(val) => val.to_string(), None => return Err(serde::de::Error::missing_field("checkForm")) };
         let license_token = match value["USER"]["OPTIONS"]["license_token"].as_str() { Some(val) => val.to_string(), None => return Err(serde::de::Error::missing_field("license_token")) };
         let id = match value["USER"]["USER_ID"].as_u64() { Some(val) => val as usize, None => return Err(serde::de::Error::missing_field("USER_ID")) };
@@ -378,7 +359,7 @@ pub struct TrackLyrics {
 }
 
 impl<'de> Deserialize<'de> for TrackLyrics {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
         Ok(TrackLyrics {})
     }
 }

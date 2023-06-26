@@ -8,7 +8,7 @@ description = "Fast no-javascript alternative Deezer Client"
 serde = "1.0.163"
 anyhow = "1.0.71"
 alsa = "0.7.0"
-eframe = "0.22.0"
+eframe = { version = "0.22.0", default-features = false, features = ["glow", "default_fonts"] }
 toml = "0.7.4"
 rizzle = { path = ".." }
 serde_derive = "1.0.163"

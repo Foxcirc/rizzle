@@ -1,20 +1,21 @@
 
-use std::fs;
+use crate::{UserInfo, Session};
 
-use crate::{Credentials, Session};
+use serde_derive::Deserialize;
+
+#[derive(Default, Deserialize)]
+struct Config {
+    pub(crate) info: UserInfo,
+}
 
 #[test]
 fn rizzle_test() {
 
-    let cred_str = fs::read_to_string("../credentials").expect("Cannot read credentials");
-    let cred_raw: Vec<&str> = cred_str.lines().collect();
-
-    let cred = Credentials {
-        sid: cred_raw[0].to_string(),
-        arl: cred_raw[1].to_string(),
-    };
+    let config_str = std::fs::read_to_string("Dizzle.toml").unwrap();
+    let config: Config = toml::from_str(&config_str).unwrap();
+    let info = config.info;
     
-    let session = Session::new(cred).expect("Cannot create new Session");
+    let mut session = Session::new(info).expect("Cannot create new Session");
 
     let result = session.search("Miraie").expect("Cannot search deezer");
 

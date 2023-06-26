@@ -10,7 +10,7 @@ use eframe::{egui, epaint::{Color32, Vec2}, emath::Align2};
 
 #[derive(Default, Deserialize)]
 struct Config {
-    pub(crate) credentials: rizzle::Credentials,
+    pub(crate) info: rizzle::UserInfo,
 }
 
 fn main() {
@@ -18,7 +18,7 @@ fn main() {
         "Dizzle",
         eframe::NativeOptions::default(),
         Box::new(|creator| Box::new(App::init(creator)))
-    ).expect("Cannot start Dizzle");
+    ).expect("Cannot start Eframe App");
 }
 
 enum Ev {
@@ -44,7 +44,7 @@ struct SharedData {
 struct App {
     lib_thread: Option<JoinHandle<()>>,
     shared: Rc<RefCell<SharedData>>,
-    tabs: Vec<Tab>,
+    history: Vec<TabHistory>,
     selected: usize,
 }
 
@@ -53,8 +53,9 @@ impl App {
     fn init(creator: &eframe::CreationContext<'_>) -> Self {
 
         let config_str = std::fs::read_to_string("Dizzle.toml").unwrap();
-        let config: Config = toml::from_str(&config_str).unwrap_or_default();
-        let info = config.credentials;
+        let config: Config = toml::from_str(&config_str).unwrap();
+        let mut info = config.info;
+        info.user_agent = "Dizzle".to_string();
 
         let (req_send, req_recv) = channel();
         let (ev_send, ev_recv) = channel();
@@ -73,7 +74,7 @@ impl App {
 
             send_event(Ev::Starting);
 
-            let maybe_session = match rizzle::Session::new(info) {
+            let mut maybe_session = match rizzle::Session::new(info) {
                 Ok(val) => {
                     Some(val)
                 },
@@ -81,7 +82,7 @@ impl App {
                     send_event(Ev::InvalidCredentials);
                     None
                 },
-                Err(..) => panic!(), // todo: handle network errors
+                Err(other) => todo!("error: {}", other), // todo: handle network errors
             };
 
             if let Some(ref _session) = maybe_session {
@@ -93,7 +94,7 @@ impl App {
                 let req = req_recv.recv().unwrap();
 
                 match maybe_session {
-                    Some(ref session) => {
+                    Some(ref mut session) => {
                         match req {
                             Req::Quit => break,
                             Req::GetUser => {
@@ -127,7 +128,7 @@ impl App {
         }));
 
         Self {
-            tabs: vec![Tab::new(&shared, TabKind::Empty)],
+            history: vec![TabHistory::new(&shared, vec![Tab::new(&shared, TabKind::Empty)])],
             lib_thread: Some(lib_thread),
             shared,
             selected: 0,
@@ -135,9 +136,9 @@ impl App {
 
     }
 
-    pub(crate) fn insert_and_switch_to_tab(&mut self, kind: TabKind) {
+    pub(crate) fn push_history(&mut self, kind: TabKind) {
         self.selected += 1;
-        self.tabs.insert(self.selected, Tab::new(&self.shared, kind));
+        self.history.insert(self.selected, TabHistory::new(&self.shared, vec![Tab::new(&self.shared, kind)]));
     }
 
     fn handle_events(&mut self) {
@@ -154,7 +155,8 @@ impl App {
                 Ev::Starting => {
                     let mut starting_tab = Tab::new(&self.shared, TabKind::Starting);
                     starting_tab.push_item(ItemKind::Starting);
-                    self.tabs[self.selected] = starting_tab;
+                    let mut starting_history = TabHistory::new(&self.shared, vec![starting_tab]);
+                    self.history[self.selected] = starting_history;
                 },
                 Ev::InvalidCredentials => {
                     self.insert_and_switch_to_tab(TabKind::InvalidCredentials);
@@ -169,7 +171,8 @@ impl App {
                     home_tab.push_item(ItemKind::Search);
                     home_tab.push_item(ItemKind::Recommended);
                     home_tab.push_item(ItemKind::News);
-                    self.tabs[self.selected] = home_tab;
+                    home_tab.push_item(ItemKind::Settings);
+                    self.history[self.selected] = home_tab;
                     self.shared.borrow().req_send.send(Req::GetUser).unwrap();
                 },
                 Ev::GotUser(result) => {
@@ -192,8 +195,8 @@ impl eframe::App for App {
 
         if !ctx.wants_keyboard_input() {
 
-            let max_self_selected = (self.tabs.len() as isize - 1).clamp(0, self.tabs.len() as isize);
-            let tab = &mut self.tabs[self.selected];
+            let max_self_selected = (self.history.len() as isize - 1).clamp(0, self.history.len() as isize);
+            let tab = &mut self.history[self.selected];
             let max_tab_selected = (tab.items.len() as isize - 1).clamp(0, tab.items.len() as isize);
 
             let mut tab_selected = tab.selected as isize;
@@ -205,6 +208,7 @@ impl eframe::App for App {
                 if input.key_pressed(egui::Key::K) && !shift { tab_selected = (tab_selected - 1).clamp(0, max_tab_selected) };
                 if input.key_pressed(egui::Key::J) &&  shift { self_selected = (self_selected + 1).clamp(0, max_self_selected) };
                 if input.key_pressed(egui::Key::K) &&  shift { self_selected = (self_selected - 1).clamp(0, max_self_selected) };
+                if input.key_pressed(egui::Key::Enter) { tab.go(tab.selected) }
             });
 
             if tab.selected != tab_selected as usize {
@@ -223,7 +227,7 @@ impl eframe::App for App {
 
                 ui.style_mut().spacing.item_spacing.y = 7.0;
 
-                for (idx, tab) in self.tabs.iter().enumerate() {
+                for (idx, tab) in self.history.iter().enumerate() {
 
                     let ui_resp = ui.add(tab);
 
@@ -252,7 +256,7 @@ impl eframe::App for App {
                     let spacing = 13.0; // used later
                     ui.style_mut().spacing.item_spacing.y = spacing;
 
-                    let tab = &mut self.tabs[self.selected];
+                    let tab = &mut self.history[self.selected];
 
                     let items = &tab.items;
                     let height: f32 = items.iter().map(|item| item.height() + spacing).sum();
@@ -291,17 +295,22 @@ impl eframe::App for App {
 
 }
 
-mod styles {
-    use eframe::egui::Color32;
+struct TabHistory {
+    shared: Rc<RefCell<SharedData>>,
+    tabs: Vec<Tab>,
+    selected: usize,
+}
 
-    pub(crate) const TAB_PANEL_WIDTH:  f32 = 160.0;
-    pub(crate) const TAB_HEIGHT: f32 = 50.0;
-
-    pub(crate) const BG1:  Color32 = Color32::from_rgb(0x12, 0x12, 0x16);
-    pub(crate) const BG2:  Color32 = Color32::from_rgb(0x19, 0x19, 0x22);
-    pub(crate) const PINK: Color32 = Color32::from_rgb(0xF0, 0x53, 0x66);
-    pub(crate) const GREY: Color32 = Color32::from_rgb(0x32, 0x32, 0x3D);
-
+impl TabHistory {
+    
+    pub(crate) fn new(shared: &Rc<RefCell<SharedData>>, tabs: Vec<Tab>) -> Self {
+        Self {
+            shared: Rc::clone(shared),
+            tabs,
+            selected: 0,
+        }
+    }
+    
 }
 
 #[derive(Clone)]
@@ -327,7 +336,7 @@ impl Tab {
         Self { shared: Rc::clone(shared), kind, items: Vec::new(), selected: 0 }
     }
 
-    pub(crate) fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str { // todo: remove this
         match self.kind {
             TabKind::Empty => "",
             TabKind::InvalidCredentials => "Invalid Credentials",
@@ -339,6 +348,12 @@ impl Tab {
 
     pub(crate) fn push_item(&mut self, kind: ItemKind) {
         self.items.push(Item::new(&self.shared, kind));
+    }
+
+    pub(crate) fn go(&mut self, index: usize) {
+        
+        todo!()
+
     }
 
 }
@@ -364,6 +379,7 @@ enum ItemKind {
     Search,
     Recommended,
     News,
+    Settings,
 }
 
 #[derive(Clone)]
@@ -381,10 +397,11 @@ impl Item {
     fn height(&self) -> f32 {
         match self.kind {
             ItemKind::Starting => 400.0,
-            ItemKind::UserProfile { .. } => 200.0,
+            ItemKind::UserProfile => 200.0,
             ItemKind::Search => 100.0,
             ItemKind::Recommended => 300.0,
             ItemKind::News => 200.0,
+            ItemKind::Settings => 200.0,
         }
     }
 
@@ -437,6 +454,13 @@ impl egui::Widget for &Item {
                 painter.text(pos, Align2::CENTER_CENTER, "News", egui::FontId::proportional(30.0), Color32::WHITE);
                 resp
             },
+            ItemKind::Settings => {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click());
+                let painter = ui.painter_at(rect);
+                let pos = rect.center();
+                painter.text(pos, Align2::CENTER_CENTER, "Settings", egui::FontId::proportional(30.0), Color32::WHITE);
+                resp
+            },
         }
 
     }
@@ -468,6 +492,19 @@ fn play_deezer_audio(audio: rizzle::RawStream) -> anyhow::Result<()> {
     pcm.drain()?;
 
     Ok(())
+
+}
+
+mod styles {
+    use eframe::egui::Color32;
+
+    pub(crate) const TAB_PANEL_WIDTH:  f32 = 160.0;
+    pub(crate) const TAB_HEIGHT: f32 = 50.0;
+
+    pub(crate) const BG1:  Color32 = Color32::from_rgb(0x12, 0x12, 0x16);
+    pub(crate) const BG2:  Color32 = Color32::from_rgb(0x19, 0x19, 0x22);
+    pub(crate) const PINK: Color32 = Color32::from_rgb(0xF0, 0x53, 0x66);
+    pub(crate) const GREY: Color32 = Color32::from_rgb(0x32, 0x32, 0x3D);
 
 }
 

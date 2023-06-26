@@ -66,16 +66,16 @@ pub(crate) fn generate_url_key(track_details: &Track, quality: usize) -> String 
 
 }
 
-pub struct Mp3Stream {
-    reader: Box<dyn Read>,
+pub struct Mp3Stream<'a> {
+    reader: rtv::BodyReader<'a>,
     blowfish: blowfish::Blowfish,
     count: usize,
     storage: ArrayVec<[u8; 2048]>,
 }
 
-impl Mp3Stream {
+impl<'a> Mp3Stream<'a> {
 
-    pub(crate) fn new(reader: Box<dyn Read>, key: &[u8]) -> Self {
+    pub(crate) fn new(reader: rtv::BodyReader<'a>, key: &[u8]) -> Self {
         Self {
             reader,
             blowfish: blowfish::Blowfish::new_from_slice(key).expect("Invalid blowfish key"),
@@ -86,7 +86,7 @@ impl Mp3Stream {
 
 }
 
-impl Read for Mp3Stream {
+impl<'a> Read for Mp3Stream<'a> {
 
     fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
 
@@ -155,15 +155,15 @@ impl Read for Mp3Stream {
 }
 
 #[cfg(feature = "decode")]
-pub struct RawStream {
-    decoder: minimp3::Decoder<Mp3Stream>,
+pub struct RawStream<'a> {
+    decoder: minimp3::Decoder<Mp3Stream<'a>>,
     storage: Vec<u8>,
 }
 
 #[cfg(feature = "decode")]
-impl RawStream {
+impl<'a> RawStream<'a> {
 
-    pub(crate) fn new(stream: Mp3Stream) -> Self {
+    pub(crate) fn new(stream: Mp3Stream<'a>) -> Self {
         Self {
             decoder: minimp3::Decoder::new(stream),
             storage: Vec::new(),
@@ -173,7 +173,7 @@ impl RawStream {
 }
 
 #[cfg(feature = "decode")]
-impl Iterator for RawStream {
+impl<'a> Iterator for RawStream<'a> {
 
     type Item = io::Result<[i16; 2]>;
 
@@ -196,7 +196,7 @@ impl Iterator for RawStream {
 }
 
 #[cfg(feature = "decode")]
-impl Read for RawStream {
+impl<'a> Read for RawStream<'a> {
 
     fn read(&mut self, buff: &mut [u8]) -> io::Result<usize> {
 
