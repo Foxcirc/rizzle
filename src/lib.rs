@@ -28,7 +28,7 @@ pub struct UserInfo {
 
 pub struct Session {
     client: rtv::SimpleClient,
-    info: UserInfo,
+    middleware: Middleware,
     user: User,
 }
 
@@ -39,16 +39,30 @@ impl Session {
         // Todo: If UserInfo is empty, Deezer will automatically use a free account I think
         // maybe add support for that (no BLOG_NAME will be present etc.)
 
-        let mut client = rtv::SimpleClient::new()?;
+        let client = rtv::SimpleClient::new()?;
 
-        let user_raw = Self::gw_light_query_raw(&mut client, &info, "", "", "deezer.getUserData", json!({}))?;
-        let user: User = Deserialize::deserialize(user_raw)?;
+        let middleware = Middleware {
+            user_agent: info.user_agent,
+            arl: info.arl,
+            sid: info.sid,
+            license_token: String::new(),
+            api_token: String::new(),
+        };
 
-        Ok(Self {
+        let mut session = Self {
             client,
-            info,
-            user,
-        })
+            middleware,
+            user: User::default(),
+        };
+
+        let resp = session.gw_light_query("deezer.getUserData", json!({}))?;
+        let user: User = Deserialize::deserialize(resp)?;
+
+        session.middleware.license_token = user.license_token.clone();
+        session.middleware.api_token = user.api_token.clone();
+        session.user = user;
+
+        Ok(session)
             
     }
 
@@ -84,7 +98,7 @@ impl Session {
         let details = O::deserialize(result)?;
 
         Ok(details)
-        
+
     }
 
     pub fn stream_mp3<'d>(&'d mut self, track: &Track) -> Result<Mp3Stream<'d>, Error> {
@@ -94,11 +108,13 @@ impl Session {
         let url_key = generate_url_key(track, song_quality);
         let blowfish_key = generate_blowfish_key(track);
 
+        let host = format!("e-cdns-proxy-{}.dzcdn.net", &track.md5_origin[0..1]);
+        let path = format!("/mobile/1/{}", url_key);
         let req = rtv::Request::get().secure()
-            .host(format!("e-cdns-proxy-{}.dzcdn.net", &track.md5_origin[0..1]))
-            .path(format!("/mobile/1/{}", url_key));
+            .host(&host)
+            .path(&path);
 
-        let resp = self.client.stream(req).map_err(|err| Error::CannotDownload(err))?;
+        let resp = self.client.stream(req)?;
 
         Ok(Mp3Stream::new(resp.body, blowfish_key.as_bytes()))
 
@@ -113,24 +129,15 @@ impl Session {
 
     }
 
-    fn decorate_request(&self, req: rtv::RequestBuilder) -> rtv::RequestBuilder {
-        Self::decorate_request_raw(req, &self.info, &self.user.license_token)
-    }
-
-    fn decorate_request_raw(req: rtv::RequestBuilder, info: &UserInfo, license_token: &str) -> rtv::RequestBuilder {
-        req.set("Accept", "*/*").set("User-Agent", &info.user_agent).set("DNT", "1").set("Cookie", &format!("sid={}; arl={}; license_token={}", info.sid, info.arl, license_token))
-    }
-
     fn pipe_query(&mut self, body: JsonValue) -> Result<JsonValue, Error> {
         
         let body_str = body.to_string();
-
         let req = rtv::Request::post().secure()
             .host("pipe.deezer.com")
             .path("/api")
-            .send_str(body_str);
+            .send(&body_str);
 
-        let req = self.decorate_request(req);
+        let req = self.middleware.decorate(req);
 
         let mut resp = JsonValue::from(self.client.send(req)?.body);
 
@@ -141,32 +148,28 @@ impl Session {
     }
 
     fn gw_light_query(&mut self, method: &str, body: JsonValue) -> Result<JsonValue, Error> {
-        Self::gw_light_query_raw(&mut self.client, &self.info, &self.user.api_token, &self.user.license_token, method, body)
-    }
-
-    fn gw_light_query_raw(client: &mut rtv::SimpleClient, info: &UserInfo, api_token: &str, license_token: &str, method: &str, body: JsonValue) -> Result<JsonValue, Error> {
 
         let body_str = body.to_string();
-
         let req = rtv::Request::post().secure()
             .host("www.deezer.com")
             .path("/ajax/gw-light.php")
             .query("method", method)
             .query("input", "3")
             .query("api_version", "1.0")
-            .query("api_token", api_token)
+            .query("api_token", &self.middleware.api_token)
             .query("cid", "94330654")
-            .send_str(body_str);
+            .send(&body_str);
 
-        let req = Self::decorate_request_raw(req, info, license_token);
+        let req = self.middleware.decorate(req);
 
-        let mut resp = client.send(req)?.into_json()?;
+        let resp = self.client.send(req)?;
+        let mut json = serde_json::from_slice(&resp.body)?;
 
-        if Self::has_csrf_token_error(&resp) {
+        if Self::has_csrf_token_error(&json) {
             return Err(Error::InvalidCredentials)
         }
 
-        let result = resp["results"].take();
+        let result = json["results"].take();
 
         Ok(result)
 
@@ -178,6 +181,28 @@ impl Session {
 
 }
 
+/// Used to decorate a request with the necessery cookies
+struct Middleware {
+    user_agent: String,
+    sid: String, // arl cookie
+    arl: String, // sid cookie (session id)
+    license_token: String,
+    api_token: String,
+}
+
+impl Middleware {
+
+    /// Decorate a request with the stored values
+    fn decorate<'d>(&'d self, builder: rtv::RequestBuilder<'d>) -> rtv::RequestBuilder<'d> {
+        builder
+            .set("DNT", "1")
+            .set("User-Agent", &self.user_agent)
+            .set("arl", &self.arl)
+            .set("sid", &self.sid)
+            .set("license_token", &self.license_token)
+    }
+    
+}
 
 pub struct DetailsQuery {
     pub(crate) api: DetailsApi,
