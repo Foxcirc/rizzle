@@ -1,8 +1,6 @@
 
 use std::{fmt, io};
 
-use crate::util::OptionError;
-
 #[derive(Debug)]
 pub enum Error {
     IoError(io::Error),
@@ -35,10 +33,3 @@ impl From<serde_json::Error> for Error {
         Self::InvalidResponse(value)
     }
 }
-
-impl From<OptionError<'_>> for Error {
-    fn from(_: OptionError) -> Self {
-        Self::UnknownInvalidResponse
-    }
-}
-

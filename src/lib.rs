@@ -1,14 +1,13 @@
 
 /*
 * Interface to deezers public and private API.
-* This library allows downloading songs, discovering music etc.
+* This library allows downloading songs, discovering music, searching etc.
 */
 
 #[cfg(test)]
 mod test;
 
 mod error;
-mod util;
 mod decrypt;
 
 use serde_derive::Deserialize;
@@ -34,7 +33,7 @@ pub struct Session {
 
 impl Session {
 
-    pub fn new(info: UserInfo) -> Result<Self, Error> {
+    pub async fn new(info: UserInfo) -> Result<Self, Error> {
 
         // Todo: If UserInfo is empty, Deezer will automatically use a free account I think
         // maybe add support for that (no BLOG_NAME will be present etc.)
@@ -55,7 +54,8 @@ impl Session {
             user: User::default(),
         };
 
-        let resp = session.gw_light_query("deezer.getUserData", json!({}))?;
+        // initial query with the only authentication being the sid and arl
+        let resp = session.gw_light_query("deezer.getUserData", json!({})).await?;
         let user: User = Deserialize::deserialize(resp)?;
 
         session.middleware.license_token = user.license_token.clone();
@@ -70,7 +70,7 @@ impl Session {
         Ok(Clone::clone(&self.user))
     }
 
-    pub fn search(&mut self, query: &str) -> Result<SearchResult, Error> {
+    pub async fn search(&mut self, query: &str) -> Result<SearchResult, Error> {
 
         let result = self.gw_light_query("deezer.pageSearch", json!({
             "query": query,
@@ -79,7 +79,7 @@ impl Session {
             "suggest": true,
             "artist_suggest": true,
             "top_tracks": true
-        }))?;
+        })).await?;
 
         let search_result = Deserialize::deserialize(result)?;
         
@@ -87,12 +87,12 @@ impl Session {
 
     }
 
-    pub fn details<'de, O: Deserialize<'de>, D: Details<'de, O>>(&mut self, item: &D) -> Result<O, Error> {
+    pub async fn details<'de, O: Deserialize<'de>, D: Details<'de, O>>(&mut self, item: &D) -> Result<O, Error> {
 
         let query = item.details_query();
         let result = match query.api {
-            DetailsApi::GwLightApi(method) => self.gw_light_query(method, query.body)?,
-            DetailsApi::PipeApi => self.pipe_query(query.body)?,
+            DetailsApi::GwLightApi(method) => self.gw_light_query(method, query.body).await?,
+            DetailsApi::PipeApi => self.pipe_query(query.body).await?,
         };
 
         let details = O::deserialize(result)?;
@@ -101,7 +101,7 @@ impl Session {
 
     }
 
-    pub fn stream_mp3<'d>(&'d mut self, track: &Track) -> Result<Mp3Stream<'d>, Error> {
+    pub async fn stream_mp3<'d>(&'d mut self, track: &Track) -> Result<Mp3Stream, Error> {
 
         let song_quality = 1;
 
@@ -114,7 +114,7 @@ impl Session {
             .host(&host)
             .path(&path);
 
-        let resp = self.client.stream(req)?;
+        let resp = self.client.stream(req).await?;
 
         Ok(Mp3Stream::new(resp.body, blowfish_key.as_bytes()))
 
@@ -122,14 +122,14 @@ impl Session {
 
 
     #[cfg(feature = "decode")]
-    pub fn stream_raw<'d>(&'d mut self, track: &Track) -> Result<RawStream<'d>, Error> {
+    pub async fn stream_raw<'d>(&'d mut self, track: &Track) -> Result<RawStream, Error> {
 
-        let stream = self.stream_mp3(track)?;
+        let stream = self.stream_mp3(track).await?;
         Ok(RawStream::new(stream))
 
     }
 
-    fn pipe_query(&mut self, body: JsonValue) -> Result<JsonValue, Error> {
+    async fn pipe_query(&mut self, body: JsonValue) -> Result<JsonValue, Error> {
         
         let body_str = body.to_string();
         let req = rtv::Request::post().secure()
@@ -139,15 +139,15 @@ impl Session {
 
         let req = self.middleware.decorate(req);
 
-        let mut resp = JsonValue::from(self.client.send(req)?.body);
-
+        let mut resp = JsonValue::from(self.client.send(req).await?.body);
+        
         let result = resp["data"].take();
 
         Ok(result)
 
     }
 
-    fn gw_light_query(&mut self, method: &str, body: JsonValue) -> Result<JsonValue, Error> {
+    async fn gw_light_query(&mut self, method: &str, body: JsonValue) -> Result<JsonValue, Error> {
 
         let body_str = body.to_string();
         let req = rtv::Request::post().secure()
@@ -162,7 +162,7 @@ impl Session {
 
         let req = self.middleware.decorate(req);
 
-        let resp = self.client.send(req)?;
+        let resp = self.client.send(req).await?;
         let mut json = serde_json::from_slice(&resp.body)?;
 
         if Self::has_csrf_token_error(&json) {
@@ -175,8 +175,15 @@ impl Session {
 
     }
 
+    // todo: this doesn't work rn
+    //       we get a "gateway error" if the request query params are wrong
     fn has_csrf_token_error(value: &JsonValue) -> bool {
-        value["error"].as_object().filter(|obj| obj["VALID_TOKEN_REQUIRED"].as_str() == Some("Invalid CSRF token")).is_some()
+        if let Some(error) = value.get("error") {
+            if let Some(_msg) = error.as_object().and_then(|opt| opt.get("GATEWAY_ERROR")) {
+                return true
+            }
+        }
+        false
     }
 
 }
@@ -197,9 +204,9 @@ impl Middleware {
         builder
             .set("DNT", "1")
             .set("User-Agent", &self.user_agent)
-            .set("arl", &self.arl)
-            .set("sid", &self.sid)
-            .set("license_token", &self.license_token)
+            .cookie("arl", &self.arl)
+            .cookie("sid", &self.sid)
+            .cookie("license_token", &self.license_token)
     }
     
 }

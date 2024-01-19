@@ -2,6 +2,7 @@
 use std::{io::{self, Read}, iter::{zip, repeat}};
 
 use cipher::{KeyInit, BlockEncrypt, BlockDecrypt};
+use futures_lite::io::BlockOn;
 use generic_array::GenericArray;
 use tinyvec::{SliceVec, ArrayVec};
 
@@ -66,18 +67,18 @@ pub(crate) fn generate_url_key(track_details: &Track, quality: usize) -> String 
 
 }
 
-pub struct Mp3Stream<'a> {
-    reader: rtv::BodyReader<'a>,
+pub struct Mp3Stream {
+    reader: BlockOn<rtv::BodyReader>, // we can just use BlockOn since rtv provides it's own reactor
     blowfish: blowfish::Blowfish,
     count: usize,
     storage: ArrayVec<[u8; 2048]>,
 }
 
-impl<'a> Mp3Stream<'a> {
+impl Mp3Stream {
 
-    pub(crate) fn new(reader: rtv::BodyReader<'a>, key: &[u8]) -> Self {
+    pub(crate) fn new(reader: rtv::BodyReader, key: &[u8]) -> Self {
         Self {
-            reader,
+            reader: BlockOn::new(reader),
             blowfish: blowfish::Blowfish::new_from_slice(key).expect("Invalid blowfish key"),
             count: 0,
             storage: Default::default(),
@@ -86,7 +87,7 @@ impl<'a> Mp3Stream<'a> {
 
 }
 
-impl<'a> Read for Mp3Stream<'a> {
+impl<'a> Read for Mp3Stream {
 
     fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
 
@@ -116,7 +117,7 @@ impl<'a> Read for Mp3Stream<'a> {
         dest.extend(self.storage.drain(..));
 
         // read the data, if there is less data on the reader left then
-        // requested, this block is not encrypted
+        // requested (the last chunk), this block is not encrypted
         let mut data = vec![0; to_read];
         match try_read_exact(&mut self.reader, &mut data) {
             ReadExact::Ok => bytes_read = len,
@@ -155,15 +156,15 @@ impl<'a> Read for Mp3Stream<'a> {
 }
 
 #[cfg(feature = "decode")]
-pub struct RawStream<'a> {
-    decoder: minimp3::Decoder<Mp3Stream<'a>>,
+pub struct RawStream {
+    decoder: minimp3::Decoder<Mp3Stream>,
     storage: Vec<u8>,
 }
 
 #[cfg(feature = "decode")]
-impl<'a> RawStream<'a> {
+impl RawStream {
 
-    pub(crate) fn new(stream: Mp3Stream<'a>) -> Self {
+    pub(crate) fn new(stream: Mp3Stream) -> Self {
         Self {
             decoder: minimp3::Decoder::new(stream),
             storage: Vec::new(),
@@ -173,78 +174,67 @@ impl<'a> RawStream<'a> {
 }
 
 #[cfg(feature = "decode")]
-impl<'a> Iterator for RawStream<'a> {
+impl Iterator for RawStream {
 
-    type Item = io::Result<[i16; 2]>;
+    type Item = io::Result<Vec<i16>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         
-        let mut dest = [0; 4];
-        match self.read_exact(&mut dest) {
-            Ok(..) => (),
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return None,
-            Err(err) => return Some(Err(err)),
-        }
+        let value = match self.decoder.next_frame() {
+            Ok(frame) => Ok(frame.data),
+            Err(minimp3::Error::Eof) => return None,
+            Err(minimp3::Error::Io(err)) => Err(err),
+            Err(other) => Err(io::Error::new(io::ErrorKind::Other, format!("error during mp3 decoding: {}", other))),
+        };
 
-        Some(Ok([
-            i16::from_ne_bytes(dest[0..2].try_into().unwrap()),
-            i16::from_ne_bytes(dest[2..4].try_into().unwrap()),
-        ]))
+        Some(value)
 
     }
 
 }
 
 #[cfg(feature = "decode")]
-impl<'a> Read for RawStream<'a> {
+impl Read for RawStream {
 
     fn read(&mut self, buff: &mut [u8]) -> io::Result<usize> {
 
-        let mut dest = SliceVec::from(buff);
-        dest.clear();
+        let mut to_copy = buff.len();
 
-        let len = dest.capacity();
+        // read as much as we can out of the storage
 
-        if len <= self.storage.len() {
-            dest.extend(self.storage.drain(..len));
-            return Ok(len);
-        }
+        let storage_len = self.storage.len().min(to_copy);
+        buff[..storage_len].copy_from_slice(&self.storage[..storage_len]);
+        self.storage.drain(..storage_len);
+        to_copy -= storage_len;
 
-        let new_len = len - self.storage.len();
+        // read some frames
 
-        let mut data: Vec<i16> = Vec::with_capacity(new_len);
+        let mut data: Vec<u8> = Vec::with_capacity(to_copy);
 
         let mut samples_read = 0;
-        while (samples_read * 2) < new_len {
+        while (samples_read * 2) < to_copy {
 
             let frame = match self.decoder.next_frame() {
                 Ok(value) => value,
                 Err(minimp3::Error::Eof) => break,
                 Err(minimp3::Error::Io(err)) => return Err(err),
-                Err(other) => return Err(io::Error::new(io::ErrorKind::Other, format!("Error during mp3 decoding: {}", other))),
+                Err(other) => return Err(io::Error::new(io::ErrorKind::Other, format!("error during mp3 decoding: {}", other))),
             };
 
             samples_read += frame.data.len();
 
-            data.extend(frame.data);
+            data.extend(frame.data.into_iter().map(|packet| packet.to_ne_bytes()).flatten());
 
         }
 
-        dest.extend(self.storage.drain(..));
+        let data_len = data.len().min(to_copy);
+        buff[storage_len..storage_len + data_len].copy_from_slice(&data[..data_len]);
 
-        // let mut transmuted_data: Vec<u8> = unsafe { std::mem::transmute(data) };
-        let mut transmuted_data: Vec<u8> = data.into_iter().flat_map(|packet| packet.to_ne_bytes()).collect();
+        self.storage.extend_from_slice(&data[data_len..]);
 
-        if samples_read >= new_len {
-            dest.extend(transmuted_data.drain(..new_len));
-            self.storage.extend(transmuted_data);
-            Ok(len)
-        } else {
-            dest.extend(transmuted_data.drain(..samples_read * 2));
-            Ok(samples_read * 2)
-        }
+        Ok(storage_len + data_len)
 
-    }
+    }    
 
 }
 
